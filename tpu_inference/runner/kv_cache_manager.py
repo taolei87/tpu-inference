@@ -47,6 +47,8 @@ from tpu_inference.logger import init_logger
 from tpu_inference.models.common.kv_share import compute_kv_share_map
 from tpu_inference.offload.utils import get_kv_connector_cache_layout
 from tpu_inference.runner import utils as runner_utils
+from tpu_inference.runner.glm5_next_kv_cache import (
+    get_glm5_next_kv_cache_spec, initialize_glm5_next_kv_cache, is_glm5_next)
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
 from tpu_inference.runner.kv_cache import (KVCacheMetadata,
                                            create_kv_cache_of_shape,
@@ -515,6 +517,9 @@ class KVCacheManager:
                     qk_rope_head_dim, 128)
             mla_head_size = padded_kv_lora_rank + mla_qk_rope_head_dim
 
+        if self._is_jax_glm5_next():
+            # GLM-5.3-Flash: per-layer KDA / MLA / indexer-tail specs.
+            return get_glm5_next_kv_cache_spec(self)
         if len(self.runner.vllm_config.compilation_config.
                static_forward_context) == 0:
             parallel_config = self.runner.parallel_config
@@ -713,6 +718,13 @@ class KVCacheManager:
 
         return kv_cache_spec
 
+    def _is_jax_glm5_next(self) -> bool:
+        """GLM-5.3-Flash served by the JAX (flax_nnx) model, whose layers are
+        not registered in vLLM's static forward context."""
+        return (is_glm5_next(self.runner.vllm_config) and len(
+            self.runner.vllm_config.compilation_config.static_forward_context)
+                == 0)
+
     def get_kv_cache_layout(self):
         return DEFAULT_KV_CACHE_LAYOUT
 
@@ -799,6 +811,17 @@ class KVCacheManager:
                                     num_blocks_list,
                                     metadata,
                                     duplicate_shared_layers=False)
+            return
+
+        if self._is_jax_glm5_next():
+            initialize_glm5_next_kv_cache(self, kv_cache_config,
+                                          layer_name_to_spec, kv_caches,
+                                          num_blocks_list, metadata)
+            self._log_kv_cache_init(kv_cache_config,
+                                    kv_caches,
+                                    num_blocks_list,
+                                    metadata,
+                                    duplicate_shared_layers=True)
             return
 
         # If this is true, then we'll initialize a new KV cache for each layer in "layers"
