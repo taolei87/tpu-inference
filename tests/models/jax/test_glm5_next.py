@@ -271,7 +271,9 @@ def test_fp8_checkpoint(tmp_path):
     with jax.default_matmul_precision("default"):
         out = _run(model, mesh, _Caches(text, dtype=jnp.bfloat16),
                    [(0, 0, 12)], ids)
-    assert _rel(out[0][0], ref[0][0]) < 0.1
+    # TPU's default precision also runs the f32 matmuls (mHC, KDA state) in
+    # bf16: about 0.11 there against 0.064 on CPU
+    assert _rel(out[0][0], ref[0][0]) < 0.15
     # top-1 agreement on most positions
     agree = (out[0][1].argmax(-1) == ref[0][1].argmax(-1)).mean()
     assert agree >= 0.75, agree
