@@ -27,22 +27,29 @@ dense and expert MLPs) get the FP8 quant config; everything else is
 unquantized.
 """
 import functools
+import re
+from typing import Any, Iterable, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
+from vllm.model_executor.models.utils import WeightsMapper
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.nope_mla_attention import (dense_nope_mla,
                                                             write_latents)
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.jax import JaxModule
-from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear
+from tpu_inference.layers.jax import JaxModule, mhc
+from tpu_inference.layers.jax.attention.kda import KimiDeltaAttention
+from tpu_inference.layers.jax.embed import JaxEmbed
+from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
 from tpu_inference.layers.jax.norm import JaxRmsNorm
-from tpu_inference.models.jax.utils.weight_utils import \
-    load_nnx_param_from_reshaped_torch
+from tpu_inference.models.jax.utils.weight_utils import (
+    JaxAutoWeightsLoader, LoadableWithIterator,
+    load_nnx_param_from_reshaped_torch)
+from tpu_inference.runner import glm5_next_kv_cache
 
 init_fn = nnx.initializers.uniform()
 
@@ -202,7 +209,8 @@ class Glm5NextMLA(JaxModule):
         self.q_a_layernorm = norm(qr, "q_a_layernorm")
         self.q_b_proj = proj("TQ,QNH->TNH", (qr, H, qk), (None, heads, None),
                              "q_b_proj")
-        if self.q_b_proj.quant_method is None:  # FP8 brings its own loader
+        # Unless a quant method (FP8) brought its own 2-D loader.
+        if not hasattr(self.q_b_proj.weight, "weight_loader"):
             self.q_b_proj.weight.set_metadata(
                 "weight_loader",
                 functools.partial(load_nnx_param_from_reshaped_torch,
@@ -260,3 +268,222 @@ class Glm5NextMLA(JaxModule):
                                scale=self.scale,
                                kvr=self.kvr)
         return (latent, pooled), self.output(o_lat)
+
+
+def _layer_metadata(attention_metadata, name: str) -> AttentionMetadata:
+    """A layer's metadata: hybrid models get one entry per layer
+    (GroupedAttentionMetadata), single-group runs one shared object."""
+    if isinstance(attention_metadata, dict):
+        return attention_metadata[name]
+    return attention_metadata
+
+
+class Glm5NextDecoderLayer(JaxModule):
+    """mHC site -> attention (KDA or MLA) -> mHC site -> MLP / MoE -> mHC
+    residual update."""
+
+    def __init__(self, config, layer_idx: int, dtype: jnp.dtype, rng: nnx.Rngs,
+                 mesh: Mesh, quant_config, prefix: str):
+        self.layer_idx = layer_idx
+        self.is_kda = config.layer_types[layer_idx] == "linear_attention"
+        self.is_moe = config.mlp_layer_types[layer_idx] == "sparse"
+        self.mesh = mesh
+        D, hc = config.hidden_size, config.hc_mult
+        M = (2 + hc) * hc
+        self.mhc_cfg = mhc.MHCConfig(hc=hc,
+                                     sinkhorn_iters=config.hc_sinkhorn_iters,
+                                     hc_eps=config.hc_eps,
+                                     rms_eps=config.rms_norm_eps)
+        self.use_mhc_kernel = mhc.mhc_kernel_available(dtype)
+
+        def norm(name):
+            return JaxRmsNorm(D,
+                              epsilon=config.rms_norm_eps,
+                              dtype=dtype,
+                              param_dtype=dtype,
+                              scale_init=nnx.with_partitioning(
+                                  init_fn, (None, )),
+                              rngs=rng,
+                              prefix=f"{prefix}.{name}")
+
+        def hc_param(shape, name):
+            return nnx.Param(init_fn(rng.params(), shape, jnp.float32),
+                             out_sharding=(None, ) * len(shape),
+                             eager_sharding=False,
+                             weight_loader=functools.partial(
+                                 load_nnx_param_from_reshaped_torch,
+                                 permute_dims=tuple(range(len(shape))),
+                                 param_name=f"{prefix}.{name}"))
+
+        self.input_layernorm = norm("input_layernorm")
+        self.post_attention_layernorm = norm("post_attention_layernorm")
+        # mHC parameters in the checkpoint layout: fn [(2 + hc) * hc, hc * D].
+        for site in ("attn", "ffn"):
+            setattr(self, f"hc_{site}_fn",
+                    hc_param((M, hc * D), f"hc_{site}_fn"))
+            setattr(self, f"hc_{site}_base", hc_param((M, ),
+                                                      f"hc_{site}_base"))
+            setattr(self, f"hc_{site}_scale",
+                    hc_param((3, ), f"hc_{site}_scale"))
+        if self.is_kda:
+            self.self_attn = KimiDeltaAttention(config,
+                                                dtype,
+                                                rng,
+                                                mesh,
+                                                prefix=f"{prefix}.self_attn")
+        else:
+            self.self_attn = Glm5NextMLA(config, dtype, rng, mesh,
+                                         quant_config, f"{prefix}.self_attn")
+        if self.is_moe:
+            self.mlp = Glm5NextMoE(config, dtype, rng, mesh, quant_config,
+                                   f"{prefix}.mlp")
+        else:
+            self.mlp = Glm5NextMLP(config.hidden_size,
+                                   config.intermediate_size,
+                                   config.swiglu_limit,
+                                   dtype,
+                                   rng,
+                                   quant_config=quant_config,
+                                   prefix=f"{prefix}.mlp")
+
+    def _site(self, name):
+        return (getattr(self, f"hc_{name}_fn").value,
+                getattr(self, f"hc_{name}_scale").value,
+                getattr(self, f"hc_{name}_base").value)
+
+    def __call__(self, kv_cache, streams: jax.Array,
+                 attention_metadata: AttentionMetadata):
+        """streams [T, hc, D] -> (new kv_cache, new streams)."""
+        kw = dict(use_kernel=self.use_mhc_kernel, mesh=self.mesh)
+        post, comb, h = mhc.mhc_pre(streams, *self._site("attn"), self.mhc_cfg,
+                                    **kw)
+        kv_cache, h = self.self_attn(kv_cache, self.input_layernorm(h),
+                                     attention_metadata)
+        streams, post, comb, h = mhc.mhc_post_pre(h, streams, post, comb,
+                                                  *self._site("ffn"),
+                                                  self.mhc_cfg, **kw)
+        h = self.mlp(self.post_attention_layernorm(h))
+        return kv_cache, mhc.mhc_post(h, streams, post, comb, **kw)
+
+
+class Glm5NextModel(JaxModule):
+
+    def __init__(self,
+                 vllm_config,
+                 rng: nnx.Rngs,
+                 mesh: Mesh,
+                 prefix: str = "model"):
+        model_config = vllm_config.model_config
+        config = model_config.hf_text_config
+        dtype = model_config.dtype
+        self.config = config
+        quant_config = vllm_config.quant_config
+        self.embed_tokens = JaxEmbed(
+            num_embeddings=model_config.get_vocab_size(),
+            features=config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            embedding_init=nnx.with_partitioning(init_fn, ("model", None)),
+            rngs=rng,
+            prefix=f"{prefix}.embed_tokens")
+        self.layers = nnx.List([
+            Glm5NextDecoderLayer(config, i, dtype, rng, mesh, quant_config,
+                                 f"{prefix}.layers.{i}")
+            for i in range(config.num_hidden_layers)
+        ])
+        self.norm = JaxRmsNorm(config.hidden_size,
+                               epsilon=config.rms_norm_eps,
+                               dtype=dtype,
+                               param_dtype=dtype,
+                               scale_init=nnx.with_partitioning(
+                                   init_fn, (None, )),
+                               rngs=rng,
+                               prefix=f"{prefix}.norm")
+
+    def __call__(self,
+                 kv_caches,
+                 input_ids,
+                 attention_metadata,
+                 layer_name_to_kv_cache: dict,
+                 inputs_embeds=None):
+        x = (self.embed_tokens(input_ids)
+             if inputs_embeds is None else inputs_embeds)
+        hc = self.config.hc_mult
+        streams = jnp.broadcast_to(x[:, None, :],
+                                   (x.shape[0], hc, x.shape[-1]))
+        kv_caches = list(kv_caches)
+        for i, layer in enumerate(self.layers):
+            name = glm5_next_kv_cache.layer_name(i)
+            idx = layer_name_to_kv_cache[name]
+            kv_caches[idx], streams = layer(
+                kv_caches[idx], streams,
+                _layer_metadata(attention_metadata, name))
+        return kv_caches, self.norm(mhc.mhc_head(streams))
+
+
+class Glm5NextForCausalLM(JaxModule, LoadableWithIterator):
+    """GLM-5.3-Flash text model. Checkpoint names come as
+    `model.language_model.*` (multimodal checkpoint) or `model.*`."""
+
+    def __init__(self, vllm_config, rng_key: jax.Array, mesh: Mesh) -> None:
+        self.vllm_config = vllm_config
+        self.mesh = mesh
+        rng = nnx.Rngs(rng_key)
+        model_config = vllm_config.model_config
+        config = model_config.hf_text_config
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise NotImplementedError(
+                "pipeline parallelism is not supported for GLM-5.3-Flash")
+        self.model = Glm5NextModel(vllm_config, rng, mesh, prefix="model")
+        self.lm_head = JaxLmHead(hidden_size=config.hidden_size,
+                                 vocab_size=model_config.get_vocab_size(),
+                                 dtype=model_config.dtype,
+                                 param_dtype=model_config.dtype,
+                                 rngs=rng,
+                                 prefix="lm_head")
+
+    def __call__(
+        self,
+        kv_caches: List[jax.Array],
+        input_ids: jax.Array,
+        attention_metadata: AttentionMetadata,
+        inputs_embeds: Optional[jax.Array] = None,
+        _input_positions=None,
+        _layer_name_to_kv_cache=None,
+        _lora_metadata=None,
+        intermediate_tensors=None,
+        is_first_rank: bool = True,
+        is_last_rank: bool = True,
+        *args,
+    ) -> Tuple[List[jax.Array], jax.Array, List[jax.Array], None]:
+        kv_caches, x = self.model(kv_caches, input_ids, attention_metadata,
+                                  dict(_layer_name_to_kv_cache), inputs_embeds)
+        return kv_caches, x, [], None
+
+    def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
+        return self.lm_head(hidden_states)
+
+    def load_weights(self, weights: Iterable[Tuple[str, Any]]) -> set:
+        num_layers = self.model.config.num_hidden_layers
+        mapper = WeightsMapper(
+            orig_to_new_prefix={"model.language_model.": "model."})
+
+        def keep(name: str) -> bool:
+            # MTP (NextN) layers sit after the decoder layers; vision and MTP
+            # are not built yet.
+            m = re.match(r"model\.layers\.(\d+)\.", name)
+            return not (m and int(m.group(1)) >= num_layers)
+
+        weights = ((n, w) for n, w in mapper.apply(weights) if keep(n))
+        # TODO(GLM-5.3-Flash M4): build the sparse indexer and load its
+        # weights; until then MLA attends densely (exact while a request's
+        # context fits in index_topk).
+        loader = JaxAutoWeightsLoader(self,
+                                      skip_prefixes=["model.visual."],
+                                      skip_substrs=[".self_attn.indexer."])
+        return loader.load_weights(weights)
+
+
+class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
+    """The checkpoint's architecture; text-only for now (the vision tower's
+    weights are skipped)."""

@@ -232,6 +232,8 @@ def kda_conv_and_core(qkv,
     core [T, H, d] f32 (before the gated output norm)).
     """
     has_init = has_initial_state_from_lens(query_start_loc, seq_lens)
+    # The conv state holds raw inputs in its own (model) dtype.
+    qkv = qkv.astype(conv_state.dtype)
     x, new_conv = ragged_conv1d(qkv,
                                 conv_state,
                                 conv_weight,
@@ -267,9 +269,10 @@ def _kda_heads_local(q, k, v, g, beta, conv_state, recurrent_state, conv_q,
     v channels side by side (the conv state's layout) and runs the core."""
     T, H = q.shape[0], q.shape[1]
     qkv = jnp.concatenate([x.reshape(T, H * head_dim) for x in (q, k, v)], -1)
+    # (weights keep the checkpoint's dtype; the conv runs in the state's)
     conv_w = jnp.concatenate([
         w.reshape(H * head_dim, kernel_size) for w in (conv_q, conv_k, conv_v)
-    ], 0)[:, None, :]
+    ], 0)[:, None, :].astype(conv_state.dtype)
     return kda_kernel(qkv,
                       g,
                       beta,

@@ -26,10 +26,8 @@ from jax.sharding import Mesh  # noqa: E402
 
 pytest.importorskip("transformers.models.glm5_next")
 
-from vllm.config import (
-    ParallelConfig,
-    VllmConfig,  # noqa: E402
-    set_current_vllm_config)
+from vllm.config import VllmConfig  # noqa: E402
+from vllm.config import ParallelConfig, set_current_vllm_config
 
 from tests.models.jax.glm5_next_ref import make_tiny_ckpt as MT  # noqa: E402
 from tests.models.jax.glm5_next_ref import ref_checkpoint as RC  # noqa: E402
@@ -192,14 +190,19 @@ def _fake_gmm(lhs,
               fuse_act=None,
               preferred_element_type=None):
     """Pure-JAX stand-in for the TPU-only grouped matmul (gmm_v2): rows are
-    sorted by group; rows outside the local groups produce zeros; a fused
+    sorted by group; rows outside the local groups produce zeros; quantized
+    weights carry per-(K block, N) scales [G, num_blocks, 1, N]; a fused
     activation splits the output into [gate | up]."""
-    assert rhs_scale is None
     m, G_local = lhs.shape[0], rhs.shape[0]
     gid = jnp.searchsorted(jnp.cumsum(group_sizes),
                            jnp.arange(m),
                            side="right") - group_offset.reshape(-1)[0]
     ok = (gid >= 0) & (gid < G_local)
+    rhs = rhs.astype(jnp.float32)
+    if rhs_scale is not None:
+        K, nb = rhs.shape[1], rhs_scale.shape[1]
+        rhs = rhs * jnp.repeat(
+            rhs_scale[:, :, 0, :].astype(jnp.float32), K // nb, axis=1)
     w = rhs[jnp.clip(gid, 0, G_local - 1)]
     out = jnp.einsum("mk,mkn->mn", lhs.astype(jnp.float32),
                      w.astype(jnp.float32))

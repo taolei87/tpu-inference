@@ -61,8 +61,10 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
 })
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
-_PP_DISABLED_MODELS: frozenset[str] = frozenset(
-    {"DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM"})
+_PP_DISABLED_MODELS: frozenset[str] = frozenset({
+    "DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM",
+    "Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"
+})
 
 
 class UnsupportedArchitectureError(ValueError):
@@ -80,6 +82,8 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.gemma4_mm import \
         Gemma4ForConditionalGeneration
     from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
+    from tpu_inference.models.jax.glm5_next import (
+        Glm5NextForCausalLM, Glm5NextForConditionalGeneration)
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -104,6 +108,9 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY["Gemma4ForCausalLM"] = Gemma4ForCausalLM
     _MODEL_REGISTRY["Gemma4MTPModel"] = Gemma4MTPForCausalLM
     _MODEL_REGISTRY["DFlashForCausalLM"] = DFlashForCausalLM
+    _MODEL_REGISTRY["Glm5NextForCausalLM"] = Glm5NextForCausalLM
+    _MODEL_REGISTRY[
+        "Glm5NextForConditionalGeneration"] = Glm5NextForConditionalGeneration
     _MODEL_REGISTRY["DFlashDraftModel"] = DFlashForCausalLM
 
     architectures = getattr(config, "architectures", [])
