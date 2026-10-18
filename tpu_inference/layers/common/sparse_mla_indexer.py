@@ -264,7 +264,10 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
             cv = jnp.concatenate([vals, sc], -1)
             ci = jnp.concatenate([idx, jnp.broadcast_to(ids, sc.shape)], -1)
             v, i = lax.top_k(cv, K)
-            return v, jnp.take_along_axis(ci, i, -1)
+            # a flat 1-D gather (take_along_axis lowers to a slow batched
+            # gather on TPU)
+            rows = jnp.arange(Tb, dtype=i.dtype)[:, None] * cv.shape[-1]
+            return v, ci.reshape(-1)[rows + i]
 
         # chunks holding at least one complete pool visible from the block
         visible_pools = (jnp.max(pos_b) + 1) // kp
@@ -302,17 +305,20 @@ def attend(q_lat, *, latent, tok, req, bt, scale: float, kvr: int,
     The latents are gathered in the cache dtype (f32 accumulation)."""
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
-    flat_latent = latent.reshape(num_pages, page_size, width)
+    # flat 1-D gathers: a token's page from the flat block table, its latent
+    # as a row of the flat cache
+    rows_of = latent.reshape(num_pages * page_size, width)
+    bt_flat = bt.reshape(-1)
+    pps = bt.shape[1]
     lo = jnp.finfo(jnp.float32).min
     f32 = jnp.float32
 
     def block(args):
         q_b, tok_b, req_b = args
-        pages = bt[req_b]  # [Tb, pps]
         ok = tok_b >= 0
         t = jnp.maximum(tok_b, 0)
-        page = jnp.take_along_axis(pages, t // page_size, axis=1)
-        keys = flat_latent[page, t % page_size, :kvr]  # [Tb, W, kvr]
+        page = bt_flat[req_b[:, None] * pps + t // page_size]
+        keys = rows_of[page * page_size + t % page_size][..., :kvr]
         s = jnp.einsum("thr,twr->thw",
                        q_b.astype(keys.dtype),
                        keys,
