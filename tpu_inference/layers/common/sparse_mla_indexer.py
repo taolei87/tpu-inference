@@ -40,9 +40,12 @@ These are the correctness implementations: queries run in blocks of
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import PartitionSpec as P
 
 from tpu_inference.layers.common.nope_mla_attention import (_cache_dims,
-                                                            _token_requests)
+                                                            _token_requests,
+                                                            write_latents)
+from tpu_inference.layers.common.sharding import ShardingAxisName
 
 
 def top_k(x, k, chunk=None):
@@ -190,3 +193,58 @@ def sparse_nope_mla(q_lat,
     blocks = tuple(x.reshape((-1, query_block) + x.shape[1:]) for x in args)
     out = lax.map(block, blocks).reshape(-1, H, kvr)[:T]
     return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
+
+
+def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
+                        positions, block_tables, seq_lens, query_start_loc,
+                        distribution, tail_slots, *, mesh, index_topk: int,
+                        scale: float, kvr: int):
+    """One MLA layer's cache writes and sparse attention under the mesh.
+
+    Requests are sharded on ATTN_DATA: with data-parallel attention the
+    runner packs one segment of tokens and metadata per rank, and each rank
+    owns its pages and slots (block tables and slots are rank-local), so every
+    shard runs the single-rank ops on its own segment. Attention heads are
+    sharded on ATTN_HEAD; the latent, pooled-key and tail caches are
+    replicated over the head shards, and every shard writes the same values.
+
+    Returns (latent, pooled, tail, o_lat [T, H, kvr]).
+    """
+    D, H = ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD
+    B, CTX = ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT
+
+    def local(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts, positions,
+              block_tables, seq_lens, query_start_loc, distribution,
+              tail_slots):
+        latent = write_latents(latent, c, positions, block_tables,
+                               query_start_loc, distribution)
+        pooled, tail = indexer_write(pooled, tail, k, gate, ape, positions,
+                                     block_tables, seq_lens, query_start_loc,
+                                     distribution, tail_slots)
+        o_lat = sparse_nope_mla(q_lat,
+                                qi,
+                                wts,
+                                latent,
+                                pooled,
+                                positions,
+                                block_tables,
+                                seq_lens,
+                                query_start_loc,
+                                distribution,
+                                index_topk=index_topk,
+                                scale=scale,
+                                kvr=kvr)
+        return latent, pooled, tail, o_lat
+
+    tok = P(D, None)
+    fn = jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(P(B, CTX), P(B), P(D), P(D, H, None), tok, tok, tok, P(),
+                  P(D, None, None), tok, P(D), P(D), P(D), P(D), P(D), P(D)),
+        out_specs=(P(B, CTX), P(B), P(D), P(D, H, None)),
+        check_vma=False,
+    )
+    return fn(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts, positions,
+              block_tables, seq_lens, query_start_loc, distribution,
+              tail_slots)

@@ -14,6 +14,7 @@
 """GLM-5.3-Flash JAX model (`models/jax/glm5_next.py`) vs the functional
 reference, through the runner-facing interface: ragged batches over paged MLA
 caches and slot-indexed KDA / indexer-tail state, across scheduler steps."""
+import dataclasses
 import os
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
@@ -95,11 +96,11 @@ def _vllm_config(model_dir, dtype="float32"):
     )
 
 
-def _build(model_dir, tp=1, dtype="float32"):
+def _build(model_dir, tp=1, dtype="float32", attn_dp=1):
     """The registered model class, built and loaded the way model_loader
     does (abstract mesh context, then load_weights over the checkpoint)."""
-    if len(jax.devices()) < tp:
-        pytest.skip(f"needs {tp} devices")
+    if len(jax.devices()) < tp * attn_dp:
+        pytest.skip(f"needs {tp * attn_dp} devices")
     vllm_config = _vllm_config(model_dir, dtype)
     from tpu_inference.layers.jax.quantization import \
         get_tpu_quantization_config
@@ -109,8 +110,8 @@ def _build(model_dir, tp=1, dtype="float32"):
     vllm_config.model_config.dtype = to_jax_dtype(
         vllm_config.model_config.dtype)
     mesh = Mesh(
-        np.array(jax.devices()[:tp]).reshape(1, 1, 1, 1, tp, 1, 1),
-        MESH_AXIS_NAMES)
+        np.array(jax.devices()[:tp * attn_dp]).reshape(1, attn_dp, 1, 1, tp, 1,
+                                                       1), MESH_AXIS_NAMES)
     with set_current_vllm_config(vllm_config), jax.set_mesh(mesh):
         model = Glm5NextForConditionalGeneration(vllm_config,
                                                  jax.random.key(0), mesh)
@@ -199,6 +200,55 @@ def _run(model, mesh, caches, step, ids):
     return out
 
 
+class _DPCaches:
+    """Data-parallel attention: one `_Caches` per rank (rank-local pages and
+    slots), stacked along the page / slot axis like the runner's
+    ATTN_DATA-sharded caches, with the runner's packed metadata layout (one
+    equally padded segment of tokens and of every metadata field per rank)."""
+
+    def __init__(self, text, ranks):
+        self.ranks = [_Caches(text, seed=r) for r in range(ranks)]
+        self.index = self.ranks[0].index
+        self.kv_caches = jax.tree.map(lambda *a: jnp.concatenate(a),
+                                      *[c.kv_caches for c in self.ranks])
+
+    def run(self, model, mesh, steps, ids):
+        """steps: one step per rank, [((rank, local id), first position,
+        num tokens)]; ids keyed by (rank, local id)."""
+        mds = [
+            c.metadata([(lid, p0, n) for (_, lid), p0, n in st])
+            for c, st in zip(self.ranks, steps)
+        ]
+        T = max(t for _, t in mds)
+        tokens, fields = [], []
+        for (md, _), st in zip(mds, steps):
+            tk = np.concatenate([ids[g][p0:p0 + n] for g, p0, n in st])
+            tokens.append(np.pad(tk, (0, T - len(tk))))
+            fields.append(
+                dataclasses.replace(md,
+                                    input_positions=jnp.pad(
+                                        md.input_positions,
+                                        (0, T - md.input_positions.shape[0]))))
+        md = jax.tree.map(lambda *a: jnp.concatenate(a), *fields)
+        names = tuple(self.index.items())
+
+        @jax.jit
+        def fwd(model, kv, tok, md):
+            kv, h, _, _ = model(kv, tok, md, None, None, names)
+            return kv, h, model.compute_logits(h)
+
+        with jax.set_mesh(mesh):
+            self.kv_caches, h, logits = fwd(
+                model, self.kv_caches, jnp.asarray(np.concatenate(tokens)), md)
+        out = {}
+        for r, st in enumerate(steps):
+            t = r * T
+            for g, p0, n in st:
+                out[g] = (np.asarray(h[t:t + n]), np.asarray(logits[t:t + n]))
+                t += n
+        return out
+
+
 def _reference(model_dir, ids, sparse="auto"):
     from transformers import Glm5NextConfig
     vllm_text = Glm5NextConfig.from_pretrained(model_dir).text_config
@@ -231,6 +281,37 @@ def test_model_matches_reference_over_two_steps(tiny_dir, tp):
         h, logits = np.concatenate([h1, h2]), np.concatenate([l1, l2])
         assert _rel(h, ref[rid][0]) < 1e-4, rid
         assert _rel(logits, ref[rid][1]) < 1e-4, rid
+
+
+def test_model_matches_reference_with_attention_dp(tmp_path):
+    """Two attention-DP ranks, each with its own requests, rank-local pages
+    and slots, over three steps (decodes first, chunked prefill remainders),
+    in the sparse regime (index_topk 16) so the pooled keys and the tails
+    carried across steps decide each query's tokens."""
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=23, index_topk=16)
+    vllm_config, model, mesh = _build(d, attn_dp=2)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(4)
+    lens = {(0, 0): 37, (0, 1): 9, (1, 0): 30, (1, 1): 34}
+    ids = {g: rng.integers(0, text.vocab_size, n) for g, n in lens.items()}
+    ref = _reference(d, ids, sparse="always")
+    caches = _DPCaches(text, 2)
+    steps = [
+        [[((0, 0), 0, 13), ((0, 1), 0, 7)], [((1, 0), 0, 18), ((1, 1), 0, 9)]],
+        [[((0, 1), 7, 1), ((0, 0), 13, 15)], [((1, 1), 9, 14),
+                                              ((1, 0), 18, 11)]],
+        [[((0, 1), 8, 1), ((0, 0), 28, 9)], [((1, 0), 29, 1),
+                                             ((1, 1), 23, 11)]],
+    ]
+    outs = [caches.run(model, mesh, st, ids) for st in steps]
+    for g in ids:
+        parts = [o[g] for o in outs if g in o]
+        h = np.concatenate([p[0] for p in parts])
+        logits = np.concatenate([p[1] for p in parts])
+        assert h.shape[0] == lens[g], g
+        assert _rel(h, ref[g][0]) < 1e-4, g
+        assert _rel(logits, ref[g][1]) < 1e-4, g
 
 
 def test_registry(tiny_dir):

@@ -27,7 +27,6 @@ dense and expert MLPs) get the FP8 quant config; everything else is
 unquantized.
 """
 import functools
-import math
 import re
 from typing import Any, Iterable, List, Optional, Tuple
 
@@ -38,10 +37,8 @@ from jax.sharding import Mesh
 from vllm.model_executor.models.utils import WeightsMapper
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-from tpu_inference.layers.common.nope_mla_attention import write_latents
 from tpu_inference.layers.common.sharding import ShardingAxisName
-from tpu_inference.layers.common.sparse_mla_indexer import (indexer_write,
-                                                            sparse_nope_mla)
+from tpu_inference.layers.common.sparse_mla_indexer import run_sparse_mla_step
 from tpu_inference.layers.jax import JaxModule, mhc
 from tpu_inference.layers.jax.attention.kda import KimiDeltaAttention
 from tpu_inference.layers.jax.embed import JaxEmbed
@@ -332,27 +329,28 @@ class Glm5NextMLA(JaxModule):
         md, tail_md = attention_metadata
         (latent, pooled), (tail, ) = kv_cache
         q_lat, c, q_resid = self.project(x)
-        latent = write_latents(latent, c, md.input_positions, md.block_tables,
-                               md.query_start_loc, md.request_distribution)
         k, gate, qi, wts = self.indexer(x, q_resid)
-        pooled, tail = indexer_write(
-            pooled, tail, k, gate, self.indexer.index_kpool_compress_ape[...],
-            md.input_positions, md.block_tables, md.seq_lens,
-            md.query_start_loc, md.request_distribution,
-            tail_md.mamba_state_indices)
-        o_lat = sparse_nope_mla(q_lat,
-                                qi,
-                                wts,
-                                latent,
-                                pooled,
-                                md.input_positions,
-                                md.block_tables,
-                                md.seq_lens,
-                                md.query_start_loc,
-                                md.request_distribution,
-                                index_topk=self.index_topk,
-                                scale=self.scale,
-                                kvr=self.kvr)
+        latent, pooled, tail, o_lat = run_sparse_mla_step(
+            latent,
+            pooled,
+            tail,
+            q_lat,
+            c,
+            k,
+            gate,
+            self.indexer.index_kpool_compress_ape[...],
+            qi,
+            wts,
+            md.input_positions,
+            md.block_tables,
+            md.seq_lens,
+            md.query_start_loc,
+            md.request_distribution,
+            tail_md.mamba_state_indices,
+            mesh=self.mesh,
+            index_topk=self.index_topk,
+            scale=self.scale,
+            kvr=self.kvr)
         return ((latent, pooled), (tail, )), self.output(o_lat)
 
 
@@ -526,16 +524,6 @@ class Glm5NextForCausalLM(JaxModule, LoadableWithIterator):
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "pipeline parallelism is not supported for GLM-5.3-Flash")
-        # The KDA / MLA / indexer ops read the single-rank metadata layout;
-        # with data-parallel attention the runner packs one segment per rank.
-        axes = ShardingAxisName.ATTN_DATA
-        axes = (axes, ) if isinstance(axes, str) else axes
-        attn_data = math.prod(mesh.shape.get(a, 1) for a in axes)
-        if attn_data > 1:
-            raise NotImplementedError(
-                f"GLM-5.3-Flash does not support data-parallel attention yet "
-                f"(attention data size {attn_data}); set "
-                '"attn_dp_size": 1 in the sharding_strategy')
         self.model = Glm5NextModel(vllm_config, rng, mesh, prefix="model")
         self.lm_head = JaxLmHead(hidden_size=config.hidden_size,
                                  vocab_size=model_config.get_vocab_size(),
