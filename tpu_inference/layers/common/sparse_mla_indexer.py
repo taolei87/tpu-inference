@@ -144,7 +144,7 @@ def sparse_nope_mla(q_lat,
                     kvr: int,
                     select_block: int = 64,
                     attend_block: int = 32,
-                    pool_chunk: int | None = 2048,
+                    pool_chunk: int | None = 8192,
                     select_shard: tuple | None = None):
     """Indexer selection + attention over the selected tokens' latents.
 
@@ -168,21 +168,26 @@ def sparse_nope_mla(q_lat,
                                     query_start_loc, distribution, page_size)
     max_reqs = query_start_loc.shape[0] - 1
     bt = block_tables.reshape(max_reqs, pps)
-    sel = functools.partial(select_tokens,
+    sel = functools.partial(select_pools,
                             pooled=pooled,
                             bt=bt,
                             page_size=page_size,
                             index_topk=index_topk,
                             pool_chunk=pool_chunk,
                             query_block=select_block)
+    kp = page_size // pooled.shape[1]
     att = functools.partial(attend,
                             latent=latent,
                             bt=bt,
+                            kp=kp,
                             scale=scale,
                             kvr=kvr,
                             query_block=attend_block)
     if select_shard is None:
-        out = att(q_lat, tok=sel(qi, wts, req, positions), req=req)
+        out = att(q_lat,
+                  pools=sel(qi, wts, req, positions),
+                  req=req,
+                  positions=positions)
     else:
         # The head shards split the queries: each selects for, and attends
         # for, its slice of T / n queries across all heads (q_lat comes in
@@ -195,18 +200,18 @@ def sparse_nope_mla(q_lat,
         def part(x):
             return lax.dynamic_slice_in_dim(x, i * Ts, Ts, axis=0)
 
-        tok = sel(part(qi), part(wts), part(req), part(positions))
+        pools = sel(part(qi), part(wts), part(req), part(positions))
         q_all = lax.all_to_all(q_lat, axis, 0, 1, tiled=True)  # [Ts, H*n]
-        out = att(q_all, tok=tok, req=part(req))
+        out = att(q_all, pools=pools, req=part(req), positions=part(positions))
         out = lax.all_to_all(out, axis, 1, 0, tiled=True)  # [T, H]
     return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
 
 
-def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
-                  index_topk: int, pool_chunk, query_block: int):
-    """The indexer's choice for every query: [T, W] token positions of its
-    request (its top index_topk // kpool pools' tokens, then its own
-    incomplete pool), -1 where a slot is unused."""
+def select_pools(qi, wts, req, positions, *, pooled, bt, page_size: int,
+                 index_topk: int, pool_chunk, query_block: int):
+    """The indexer's choice for every query: [T, K + 1] pool ids of its
+    request (its top K = index_topk // kpool pools, then its own pool while
+    incomplete), -1 where a slot is unused."""
     T = qi.shape[0]
     _, prows, ihd = pooled.shape
     kp = page_size // prows
@@ -278,14 +283,12 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
     def block(args):
         qi_b, w_b, req_b, pos_b = args
         vals, pools = select(qi_b, w_b, req_b, pos_b)
-        tok = pools[..., None] * kp + jnp.arange(kp)  # [Tb, K, kp]
-        tok = jnp.where((vals > lo)[..., None], tok, -1).reshape(-1, K * kp)
-        # plus the query's own incomplete pool: positions start .. pos
-        start = (pos_b + 1) - (pos_b + 1) % kp
-        off = jnp.arange(kp - 1)
-        tail = jnp.where(start[:, None] + off <= pos_b[:, None],
-                         start[:, None] + off, -1)
-        return jnp.concatenate([tok, tail], -1).astype(jnp.int32)  # [Tb, W]
+        pools = jnp.where(vals > lo, pools, -1)  # [Tb, K]
+        # plus the query's own pool while it is incomplete (its tokens up to
+        # the query; a complete pool is selectable like any other)
+        own = jnp.where(pos_b % kp != kp - 1, pos_b // kp, -1)
+        return jnp.concatenate([pools, own[:, None]],
+                               -1).astype(jnp.int32)  # [Tb, K + 1]
 
     query_block = min(query_block, T)  # small (decode) batches never pad
     pad = (-T) % query_block
@@ -298,32 +301,35 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
     return tok.reshape(-1, tok.shape[-1])[:T]
 
 
-def attend(q_lat, *, latent, tok, req, bt, scale: float, kvr: int,
-           query_block: int):
-    """Softmax attention of every query over its selected tokens' latents
-    (K = V = c). tok [T, W] from select_tokens. Returns [T, H, kvr] f32.
-    The latents are gathered in the cache dtype (f32 accumulation)."""
+def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
+           kvr: int, query_block: int):
+    """Softmax attention of every query over the latents of its selected
+    pools' tokens (K = V = c; the own pool's tokens up to the query). pools
+    [T, K + 1] from select_pools. Returns [T, H, kvr] f32. The latents are
+    gathered as rows of kpool tokens, in the cache dtype."""
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
-    # flat 1-D gathers: a token's page from the flat block table, its latent
-    # as a row of the flat cache
-    rows_of = latent.reshape(num_pages * page_size, width)
+    ppp = page_size // kp  # pools per page
+    pool_rows = latent.reshape(num_pages * ppp, kp, width)
     bt_flat = bt.reshape(-1)
     pps = bt.shape[1]
     lo = jnp.finfo(jnp.float32).min
     f32 = jnp.float32
 
     def block(args):
-        q_b, tok_b, req_b = args
-        ok = tok_b >= 0
-        t = jnp.maximum(tok_b, 0)
-        page = bt_flat[req_b[:, None] * pps + t // page_size]
-        keys = rows_of[page * page_size + t % page_size][..., :kvr]
+        q_b, pool_b, req_b, pos_b = args
+        Tb, n = pool_b.shape
+        pl = jnp.maximum(pool_b, 0)
+        page = bt_flat[req_b[:, None] * pps + pl // ppp]  # [Tb, n]
+        keys = pool_rows[page * ppp + pl % ppp][..., :kvr]  # [Tb, n, kp, kvr]
+        keys = keys.reshape(Tb, n * kp, kvr)
+        tpos = pl[..., None] * kp + jnp.arange(kp)
+        ok = (pool_b >= 0)[..., None] & (tpos <= pos_b[:, None, None])
         s = jnp.einsum("thr,twr->thw",
                        q_b.astype(keys.dtype),
                        keys,
                        preferred_element_type=f32) * scale
-        s = jnp.where(ok[:, None], s, lo)
+        s = jnp.where(ok.reshape(Tb, 1, n * kp), s, lo)
         p = jax.nn.softmax(s, -1)
         return jnp.einsum("thw,twr->thr",
                           p.astype(keys.dtype),
@@ -334,7 +340,7 @@ def attend(q_lat, *, latent, tok, req, bt, scale: float, kvr: int,
     pad = (-T) % query_block
     args = [
         jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
-        for x in (q_lat, tok, req)
+        for x in (q_lat, pools, req, positions)
     ]
     blocks = tuple(x.reshape((-1, query_block) + x.shape[1:]) for x in args)
     return lax.map(block, blocks).reshape(-1, H, kvr)[:T]
