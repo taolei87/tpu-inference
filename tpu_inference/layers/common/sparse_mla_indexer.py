@@ -310,7 +310,6 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
     ppp = page_size // kp  # pools per page
-    pool_rows = latent.reshape(num_pages * ppp, kp, width)
     bt_flat = bt.reshape(-1)
     pps = bt.shape[1]
     lo = jnp.finfo(jnp.float32).min
@@ -321,7 +320,10 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
         Tb, n = pool_b.shape
         pl = jnp.maximum(pool_b, 0)
         page = bt_flat[req_b[:, None] * pps + pl // ppp]  # [Tb, n]
-        keys = pool_rows[page * ppp + pl % ppp][..., :kvr]  # [Tb, n, kp, kvr]
+        # gathered from the cache in its own layout: a reshape of the cache
+        # would copy all of it on TPU (tiled layout), every call
+        off = (pl % ppp)[..., None] * kp + jnp.arange(kp)  # [Tb, n, kp]
+        keys = latent[page[..., None], off // packing, off % packing, :kvr]
         keys = keys.reshape(Tb, n * kp, kvr)
         tpos = pl[..., None] * kp + jnp.arange(kp)
         ok = (pool_b >= 0)[..., None] & (tpos <= pos_b[:, None, None])

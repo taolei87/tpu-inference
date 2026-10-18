@@ -104,3 +104,18 @@ def test_shared_key_gather_matches_per_query(pool_chunk):
                                np.asarray(per_query),
                                rtol=1e-6,
                                atol=1e-6)
+
+
+def test_packed_latent_cache_layout():
+    """The same latents stored two tokens per row (packing 2, as the TPU
+    MLA cache packs bf16) give the same attention as packing 1."""
+    args = list(_inputs(3, False))
+    kw = dict(index_topk=32, scale=KVR**-0.5, kvr=KVR, pool_chunk=8)
+    flat = sparse_nope_mla(*args, **kw)
+    lat = np.asarray(args[3])  # [pages, PAGE, 1, KVR]
+    args[3] = jnp.asarray(lat.reshape(lat.shape[0], PAGE // 2, 2, KVR))
+    packed = sparse_nope_mla(*args, **kw)
+    np.testing.assert_allclose(np.asarray(packed),
+                               np.asarray(flat),
+                               rtol=1e-6,
+                               atol=1e-6)
