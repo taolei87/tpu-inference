@@ -267,8 +267,10 @@ def test_fp8_checkpoint(tmp_path):
     rng = np.random.default_rng(2)
     ids = {0: rng.integers(0, text.vocab_size, 12)}
     ref = _reference(d, ids)  # f32 on the exactly dequantized FP8 weights
-    out = _run(model, mesh, _Caches(text, dtype=jnp.bfloat16), [(0, 0, 12)],
-               ids)
+    # The FP8 GMM kernel's bf16 dots can't lower at "highest" precision
+    with jax.default_matmul_precision("default"):
+        out = _run(model, mesh, _Caches(text, dtype=jnp.bfloat16),
+                   [(0, 0, 12)], ids)
     assert _rel(out[0][0], ref[0][0]) < 0.1
     # top-1 agreement on most positions
     agree = (out[0][1].argmax(-1) == ref[0][1].argmax(-1)).mean()
