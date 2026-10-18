@@ -147,8 +147,8 @@ class KimiDeltaAttention(JaxModule):
         md = attention_metadata
         f32 = jnp.float32
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)  # [T, H, d]
-        f = self.f_b_proj(self.f_a_proj(x)).astype(f32) + self.dt_bias.value
-        decay_rate = jnp.exp(self.A_log.value.astype(f32))[:, None]
+        f = self.f_b_proj(self.f_a_proj(x)).astype(f32) + self.dt_bias[...]
+        decay_rate = jnp.exp(self.A_log[...].astype(f32))[:, None]
         if self.gate_lower_bound is not None:
             g = self.gate_lower_bound * jax.nn.sigmoid(decay_rate * f)
         else:
@@ -163,9 +163,9 @@ class KimiDeltaAttention(JaxModule):
                                                 beta,
                                                 conv_state,
                                                 recurrent_state,
-                                                self.q_conv1d.weight.value,
-                                                self.k_conv1d.weight.value,
-                                                self.v_conv1d.weight.value,
+                                                self.q_conv1d.weight[...],
+                                                self.k_conv1d.weight[...],
+                                                self.v_conv1d.weight[...],
                                                 md.mamba_state_indices,
                                                 md.query_start_loc,
                                                 md.request_distribution,
@@ -174,6 +174,6 @@ class KimiDeltaAttention(JaxModule):
         # Gated RMSNorm over each head (fp32, sigmoid gate).
         o = core * jax.lax.rsqrt(
             jnp.mean(core * core, -1, keepdims=True) + self.eps)
-        o = o * self.o_norm.weight.value.astype(f32)
+        o = o * self.o_norm.weight[...].astype(f32)
         o = o * jax.nn.sigmoid(gate.astype(f32))
         return new_cache, self.o_proj(o.astype(x.dtype))

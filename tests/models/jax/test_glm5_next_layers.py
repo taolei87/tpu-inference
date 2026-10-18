@@ -245,75 +245,103 @@ def test_moe_matches_reference(tiny, tp, monkeypatch):
 
 
 # ----------------------------------------------------------------------------- MLA
-def _paged_md(lens, ctx, max_reqs, pages_per_seq, page_size, rng):
-    """AttentionMetadata of a ragged step: request i has ctx[i] cached tokens
-    and lens[i] new ones."""
-    num_pages = max_reqs * pages_per_seq + 1
-    pages = rng.permutation(np.arange(1, num_pages)).astype(np.int32)
-    bt = pages[:max_reqs * pages_per_seq]
-    qsl = np.full(max_reqs + 1, sum(lens), np.int32)
-    qsl[:len(lens) + 1] = np.concatenate([[0], np.cumsum(lens)])
-    pos = np.concatenate([np.arange(c, c + n) for n, c in zip(lens, ctx)])
-    T = len(pos) + 3  # padding tokens
-    pos = np.pad(pos, (0, 3)).astype(np.int32)
-    seq_lens = np.zeros(max_reqs, np.int32)
-    seq_lens[:len(lens)] = np.array(lens) + np.array(ctx)
-    n_dec = sum(1 for n, c in zip(lens, ctx) if n == 1 and c > 0)
-    md = AttentionMetadata(input_positions=jnp.asarray(pos),
-                           block_tables=jnp.asarray(bt),
-                           seq_lens=jnp.asarray(seq_lens),
-                           query_start_loc=jnp.asarray(qsl),
-                           request_distribution=jnp.asarray(
-                               [n_dec, len(lens), len(lens)], jnp.int32))
-    return md, num_pages, T
+class _Steps:
+    """Persistent per-request pages and slots, and the AttentionMetadata of
+    each scheduler step ([(request id, first position, num tokens)], decodes
+    first)."""
+
+    def __init__(self, max_reqs, pages_per_seq, page_size, seed=0):
+        rng = np.random.default_rng(seed)
+        self.max_reqs, self.pps = max_reqs, pages_per_seq
+        self.num_pages = max_reqs * pages_per_seq + 1
+        self.bt = rng.permutation(np.arange(1, self.num_pages)).astype(
+            np.int32).reshape(max_reqs, pages_per_seq)
+        self.slots = rng.permutation(np.arange(1, max_reqs + 2))[:max_reqs]
+        self.num_slots = max_reqs + 2
+
+    def metadata(self, step):
+        n = sum(k for _, _, k in step)
+        T = -(-(n + 1) // 16) * 16  # padded like the runner's token buckets
+        pos = np.zeros(T, np.int32)
+        qsl = np.full(self.max_reqs + 1, n, np.int32)
+        qsl[0] = 0
+        seq_lens = np.zeros(self.max_reqs, np.int32)
+        bt = np.zeros((self.max_reqs, self.pps), np.int32)
+        slots = np.zeros(self.max_reqs, np.int32)
+        t = 0
+        for i, (rid, p0, k) in enumerate(step):
+            pos[t:t + k] = np.arange(p0, p0 + k)
+            t += k
+            qsl[i + 1] = t
+            seq_lens[i] = p0 + k
+            bt[i] = self.bt[rid]
+            slots[i] = self.slots[rid]
+        n_dec = sum(1 for _, p0, k in step if k == 1 and p0 > 0)
+        return AttentionMetadata(
+            input_positions=jnp.asarray(pos),
+            block_tables=jnp.asarray(bt.reshape(-1)),
+            seq_lens=jnp.asarray(seq_lens),
+            query_start_loc=jnp.asarray(qsl),
+            request_distribution=jnp.asarray(
+                [n_dec, len(step), len(step)], jnp.int32),
+            mamba_state_indices=jnp.asarray(slots)), T
 
 
-def test_dense_mla_matches_reference(tiny):
-    """A request's prefill split over two scheduler steps (the second step
-    batched with a decode of another request) == the reference over the
-    whole sequence."""
-    d, text, ref, rcfg = tiny
+# Three requests over four steps: chunk boundaries at every position mod 4
+# (pools complete across steps through the tail), decodes batched first.
+_SEQ_LENS = {0: 45, 1: 23, 2: 11}
+_STEPS = [
+    [(0, 0, 18), (1, 0, 7), (2, 0, 9)],
+    [(2, 9, 1), (0, 18, 5), (1, 7, 9)],
+    [(0, 23, 1), (2, 10, 1), (1, 16, 7)],
+    [(0, 24, 21)],
+]
+
+
+@pytest.mark.parametrize("index_topk", [64, 16])
+def test_mla_matches_reference(tmp_path, index_topk):
+    """MLA with the k-pool indexer over multi-step ragged batches == the
+    reference over each whole sequence: dense regime (index_topk 64 covers
+    every request) and sparse (16: 4 pools per query)."""
+    d = str(tmp_path)
+    _, cfg = MT.write_tiny_checkpoint(d, seed=12, index_topk=index_topk)
+    text = cfg.text_config
+    ref = jax.tree.map(jnp.asarray, RC.load_ref_params(d, text))
+    rcfg = R.Cfg.from_hf(text)
     mesh = _mesh()
     with jax.set_mesh(mesh):
         mla = G.Glm5NextMLA(text, jnp.float32, nnx.Rngs(0), mesh, None,
                             f"layers.{MLA_LAYER}.self_attn")
-    # the indexer (sparse attention) is added in M4
-    _load(mla,
-          d,
-          f"{RC.PREFIX}layers.{MLA_LAYER}.self_attn.",
-          mesh,
-          skip=(".indexer.", ))
+    _load(mla, d, f"{RC.PREFIX}layers.{MLA_LAYER}.self_attn.", mesh)
     p = ref["layers"][MLA_LAYER]["attn"]
     rng = np.random.default_rng(4)
-    D, page_size, pps, max_reqs = text.hidden_size, 8, 8, 4
-    xa = rng.standard_normal((30, D)).astype(np.float32)  # request 0
-    xb = rng.standard_normal((12, D)).astype(np.float32)  # request 1
+    xs = {
+        r: rng.standard_normal((n, text.hidden_size)).astype(np.float32)
+        for r, n in _SEQ_LENS.items()
+    }
+    page_size = 8
+    st = _Steps(max_reqs=4, pages_per_seq=8, page_size=page_size)
     kvr_pad = -(-text.kv_lora_rank // 128) * 128
-
-    def step(cache, md, x):
-        x = np.pad(x, ((0, md.input_positions.shape[0] - len(x)), (0, 0)))
-        (cache,
-         _), y = jax.jit(lambda m, c, x, md: m(c, x, md))(mla, (cache, None),
-                                                          jnp.asarray(x), md)
-        return cache, np.asarray(y)
-
-    md1, num_pages, _ = _paged_md([18, 11], [0, 0], max_reqs, pps, page_size,
-                                  np.random.default_rng(5))
-    cache = jnp.zeros((num_pages, page_size, 1, kvr_pad), jnp.float32)
-    cache, y1 = step(cache, md1, np.concatenate([xa[:18], xb[:11]]))
-    # second step: the rest of request 0 and one decode token of request 1
-    md2 = AttentionMetadata(
-        input_positions=jnp.asarray(
-            np.pad(np.concatenate([np.arange(18, 30), [11]]),
-                   (0, 3)).astype(np.int32)),
-        block_tables=md1.block_tables,
-        seq_lens=jnp.asarray(np.array([30, 12, 0, 0], np.int32)),
-        query_start_loc=jnp.asarray(np.array([0, 12, 13, 13, 13], np.int32)),
-        request_distribution=jnp.asarray([0, 2, 2], jnp.int32))
-    cache, y2 = step(cache, md2, np.concatenate([xa[18:], xb[11:]]))
-    ra, _ = R.mla_attention(p, jnp.asarray(xa[None]), rcfg, sparse=None)
-    rb, _ = R.mla_attention(p, jnp.asarray(xb[None]), rcfg, sparse=None)
-    assert _rel(y1[:18], ra[0, :18]) < 1e-4
-    assert _rel(y1[18:29], rb[0, :11]) < 1e-4
-    assert _rel(y2[:12], ra[0, 18:]) < 1e-4
-    assert _rel(y2[12:13], rb[0, 11:]) < 1e-4
+    kp, ihd = text.index_kpool, text.index_head_dim
+    cache = ((jnp.zeros((st.num_pages, page_size, 1, kvr_pad), jnp.float32),
+              jnp.zeros((st.num_pages, page_size // kp, ihd),
+                        jnp.float32)), (jnp.zeros((st.num_slots, kp, 2 * ihd),
+                                                  jnp.float32), ))
+    run = jax.jit(lambda m, c, x, md: m(c, x, (md, md)))
+    got = {r: [] for r in xs}
+    for step in _STEPS:
+        md, T = st.metadata(step)
+        x = np.concatenate([xs[r][p0:p0 + k] for r, p0, k in step])
+        cache, y = run(mla, cache,
+                       jnp.asarray(np.pad(x, ((0, T - len(x)), (0, 0)))), md)
+        t = 0
+        for r, _, k in step:
+            got[r].append(np.asarray(y[t:t + k]))
+            t += k
+    sparse = "always" if index_topk < max(_SEQ_LENS.values()) else None
+    for r, x in xs.items():
+        want, _ = R.mla_attention(p, jnp.asarray(x[None]), rcfg, sparse=sparse)
+        assert _rel(np.concatenate(got[r]), want[0]) < 1e-4, r
+    if sparse:  # the test exercises sparsity: dense attention differs
+        dense, _ = R.mla_attention(p, jnp.asarray(xs[0][None]), rcfg)
+        assert _rel(np.concatenate(got[0]), dense[0]) > 1e-3

@@ -26,13 +26,9 @@ from jax.sharding import Mesh  # noqa: E402
 
 pytest.importorskip("transformers.models.glm5_next")
 
-from vllm.config import (
-    CacheConfig,
-    ModelConfig,  # noqa: E402
-    ParallelConfig,
-    SchedulerConfig,
-    VllmConfig,
-    set_current_vllm_config)
+from vllm.config import ModelConfig  # noqa: E402
+from vllm.config import (CacheConfig, ParallelConfig, SchedulerConfig,
+                         VllmConfig, set_current_vllm_config)
 
 from tests.models.jax.glm5_next_ref import make_tiny_ckpt as MT  # noqa: E402
 from tests.models.jax.glm5_next_ref import ref_checkpoint as RC  # noqa: E402
@@ -187,7 +183,7 @@ def _run(model, mesh, caches, step, ids):
     return out
 
 
-def _reference(model_dir, ids, n_layers=None):
+def _reference(model_dir, ids, sparse="auto"):
     from transformers import Glm5NextConfig
     vllm_text = Glm5NextConfig.from_pretrained(model_dir).text_config
     params = jax.tree.map(jnp.asarray,
@@ -195,7 +191,7 @@ def _reference(model_dir, ids, n_layers=None):
     rcfg = R.Cfg.from_hf(vllm_text)
     out = {}
     for rid, seq in ids.items():
-        h, _ = R.forward(params, jnp.asarray(seq[None]), rcfg)
+        h, _ = R.forward(params, jnp.asarray(seq[None]), rcfg, sparse=sparse)
         out[rid] = (np.asarray(h[0]), np.asarray(R.logits(params, h)[0]))
     return out
 
@@ -239,7 +235,7 @@ def test_loaded_parameters(tiny_dir):
     names = {n for n, _ in model.named_parameters()}
     assert "model.layers.0.hc_attn_fn" in names
     assert "model.layers.2.self_attn.kv_b_proj.weight" in names
-    assert not any("indexer" in n for n in names)  # added in M4
+    assert "model.layers.2.self_attn.indexer.index_kpool_compress_ape" in names
 
 
 def test_fp8_checkpoint(tmp_path):
@@ -261,3 +257,31 @@ def test_fp8_checkpoint(tmp_path):
     # top-1 agreement on most positions
     agree = (out[0][1].argmax(-1) == ref[0][1].argmax(-1)).mean()
     assert agree >= 0.75, agree
+
+
+def test_sparse_model_matches_reference(tmp_path):
+    """index_topk 16 (4 pools per query) with 37- and 30-token requests over
+    three steps: the sparse indexer through the whole model."""
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=23, index_topk=16)
+    vllm_config, model, mesh = _build(d)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(3)
+    ids = {
+        0: rng.integers(0, text.vocab_size, 37),
+        1: rng.integers(0, text.vocab_size, 30)
+    }
+    ref = _reference(d, ids, sparse="always")
+    caches = _Caches(text)
+    steps = [[(0, 0, 14), (1, 0, 17)], [(1, 17, 1), (0, 14, 22)],
+             [(0, 36, 1), (1, 18, 12)]]
+    got = {r: [] for r in ids}
+    for step in steps:
+        out = _run(model, mesh, caches, step, ids)
+        for r in out:
+            got[r].append(out[r])
+    for r in ids:
+        h = np.concatenate([g[0] for g in got[r]])
+        logits = np.concatenate([g[1] for g in got[r]])
+        assert _rel(h, ref[r][0]) < 1e-4, r
+        assert _rel(logits, ref[r][1]) < 1e-4, r

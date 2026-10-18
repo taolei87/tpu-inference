@@ -37,15 +37,16 @@ from jax.sharding import Mesh
 from vllm.model_executor.models.utils import WeightsMapper
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-from tpu_inference.layers.common.nope_mla_attention import (dense_nope_mla,
-                                                            write_latents)
+from tpu_inference.layers.common.nope_mla_attention import write_latents
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sparse_mla_indexer import (indexer_write,
+                                                            sparse_nope_mla)
 from tpu_inference.layers.jax import JaxModule, mhc
 from tpu_inference.layers.jax.attention.kda import KimiDeltaAttention
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
-from tpu_inference.layers.jax.norm import JaxRmsNorm
+from tpu_inference.layers.jax.norm import JaxLayerNorm, JaxRmsNorm
 from tpu_inference.models.jax.utils.weight_utils import (
     JaxAutoWeightsLoader, LoadableWithIterator,
     load_nnx_param_from_reshaped_torch)
@@ -115,7 +116,7 @@ class Glm5NextRouter(JaxModule):
         """Router logits [T, E] in f32 (sigmoid is applied by the experts)."""
         return jnp.einsum("td,de->te",
                           x.astype(jnp.float32),
-                          self.weight.value,
+                          self.weight[...],
                           precision=jax.lax.Precision.HIGHEST)
 
 
@@ -158,19 +159,88 @@ class Glm5NextMoE(JaxModule):
         routed, _ = self.experts(
             x,
             self.gate(x),
-            e_score_correction_bias=self.gate.e_score_correction_bias.value)
+            e_score_correction_bias=self.gate.e_score_correction_bias[...])
         return (routed * self.routed_scaling_factor).astype(
             x.dtype) + self.shared_experts(x)
 
 
+class Glm5NextIndexer(JaxModule):
+    """DSA indexer with k-pool compression (`self_attn.indexer`): per-token
+    keys (LayerNorm'd) and pooling gates, per-head queries from the MLA query
+    residual and per-head weights. Replicated over TP; unquantized."""
+
+    def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, prefix: str):
+        D, qr = config.hidden_size, config.q_lora_rank
+        IH, ihd, kp = (config.index_n_heads, config.index_head_dim,
+                       config.index_kpool)
+        self.num_heads, self.head_dim = IH, ihd
+
+        def linear(i, o, name):
+            return JaxLinear(i,
+                             o,
+                             use_bias=False,
+                             dtype=dtype,
+                             kernel_init=nnx.with_partitioning(
+                                 init_fn, (None, None)),
+                             rngs=rng,
+                             quant_config=None,
+                             prefix=f"{prefix}.{name}")
+
+        self.wq_b = JaxEinsum("TQ,QNH->TNH", (qr, IH, ihd),
+                              dtype=dtype,
+                              param_dtype=dtype,
+                              kernel_init=nnx.with_partitioning(
+                                  init_fn, (None, None, None)),
+                              rngs=rng,
+                              quant_config=None,
+                              prefix=f"{prefix}.wq_b")
+        self.wq_b.weight.set_metadata(
+            "weight_loader",
+            functools.partial(load_nnx_param_from_reshaped_torch,
+                              reshape_dims=(IH, ihd, qr),
+                              permute_dims=(2, 0, 1),
+                              param_name=f"{prefix}.wq_b.weight"))
+        self.wk = linear(D, ihd, "wk")
+        self.k_norm = JaxLayerNorm(ihd,
+                                   epsilon=1e-6,
+                                   dtype=dtype,
+                                   param_dtype=dtype,
+                                   rngs=rng)
+        self.weights_proj = linear(D, IH, "weights_proj")
+        # [kpool, ihd] as stored (no transpose); the gate is stored [ihd, D].
+        self.index_kpool_compress_ape = nnx.Param(
+            init_fn(rng.params(), (kp, ihd), jnp.float32),
+            out_sharding=(None, None),
+            eager_sharding=False,
+            weight_loader=functools.partial(
+                load_nnx_param_from_reshaped_torch,
+                permute_dims=(0, 1),
+                param_name=f"{prefix}.index_kpool_compress_ape"))
+        self.index_kpool_compress_gate = nnx.Param(init_fn(
+            rng.params(), (D, ihd), dtype),
+                                                   out_sharding=(None, None),
+                                                   eager_sharding=False)
+
+    def __call__(self, x: jax.Array, q_resid: jax.Array):
+        """-> (keys [T, ihd], gates [T, ihd], queries [T, IH, ihd] f32,
+        head weights [T, IH] f32, already scaled by IH^-0.5)."""
+        f32 = jnp.float32
+        k = self.k_norm(self.wk(x))
+        gate = x @ self.index_kpool_compress_gate[...]
+        q = self.wq_b(q_resid).astype(f32)
+        # f32 head weights: bf16 flips near-tie pool rankings at long context
+        w = jnp.einsum("td,dh->th",
+                       x.astype(f32),
+                       self.weights_proj.weight[...].astype(f32),
+                       precision=jax.lax.Precision.HIGHEST)
+        return k, gate, q, w * self.num_heads**-0.5
+
+
 class Glm5NextMLA(JaxModule):
     """NoPE multi-head latent attention with the key/value up-projection
-    absorbed: attention runs on the normalized latents (K = V = c).
-
-    kv_cache: the MLA layer's (latent pages, pooled indexer keys); the pooled
-    keys are used by the sparse indexer (M4), dense attention reads only the
-    latents.
-    """
+    absorbed (attention runs on the normalized latents, K = V = c) and the
+    k-pool sparse indexer choosing each query's tokens
+    (`layers/common/sparse_mla_indexer.py`)."""
 
     def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, mesh: Mesh,
                  quant_config, prefix: str):
@@ -234,6 +304,8 @@ class Glm5NextMLA(JaxModule):
                               param_name=f"{prefix}.kv_b_proj.weight"))
         self.o_proj = proj("TNH,NHD->TD", (H, dv, D), (heads, None, None),
                            "o_proj")
+        self.index_topk = config.index_topk
+        self.indexer = Glm5NextIndexer(config, dtype, rng, f"{prefix}.indexer")
 
     def project(self, x: jax.Array):
         """x [T, D] -> (q_lat [T, H, kvr], latents c [T, kvr], q_resid [T,
@@ -241,33 +313,43 @@ class Glm5NextMLA(JaxModule):
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
         q = self.q_b_proj(q_resid)  # [T, H, qk]
         c = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))
-        w_k = self.kv_b_proj.weight.value[..., :self.qk]  # [kvr, H, qk]
+        w_k = self.kv_b_proj.weight[...][..., :self.qk]  # [kvr, H, qk]
         q_lat = jnp.einsum("thq,rhq->thr", q, w_k)
         return q_lat, c, q_resid
 
     def output(self, o_lat: jax.Array) -> jax.Array:
-        w_v = self.kv_b_proj.weight.value[..., self.qk:]  # [kvr, H, dv]
+        w_v = self.kv_b_proj.weight[...][..., self.qk:]  # [kvr, H, dv]
         return self.o_proj(jnp.einsum("thr,rhv->thv", o_lat, w_v))
 
-    def __call__(self, kv_cache, x: jax.Array,
-                 attention_metadata: AttentionMetadata):
-        """Dense causal attention (exact while a request's context fits in the
-        indexer's top-k). Returns (new kv_cache, y [T, D])."""
-        md = attention_metadata
-        latent, pooled = kv_cache
-        q_lat, c, _ = self.project(x)
+    def __call__(self, kv_cache, x: jax.Array, attention_metadata):
+        """kv_cache: ((latent pages, pooled keys), (indexer tail, ));
+        attention_metadata: (this layer's, the indexer tail's). Returns (new
+        kv_cache, y [T, D])."""
+        md, tail_md = attention_metadata
+        (latent, pooled), (tail, ) = kv_cache
+        q_lat, c, q_resid = self.project(x)
         latent = write_latents(latent, c, md.input_positions, md.block_tables,
                                md.query_start_loc, md.request_distribution)
-        o_lat = dense_nope_mla(q_lat,
-                               latent,
-                               md.input_positions,
-                               md.block_tables,
-                               md.seq_lens,
-                               md.query_start_loc,
-                               md.request_distribution,
-                               scale=self.scale,
-                               kvr=self.kvr)
-        return (latent, pooled), self.output(o_lat)
+        k, gate, qi, wts = self.indexer(x, q_resid)
+        pooled, tail = indexer_write(
+            pooled, tail, k, gate, self.indexer.index_kpool_compress_ape[...],
+            md.input_positions, md.block_tables, md.seq_lens,
+            md.query_start_loc, md.request_distribution,
+            tail_md.mamba_state_indices)
+        o_lat = sparse_nope_mla(q_lat,
+                                qi,
+                                wts,
+                                latent,
+                                pooled,
+                                md.input_positions,
+                                md.block_tables,
+                                md.seq_lens,
+                                md.query_start_loc,
+                                md.request_distribution,
+                                index_topk=self.index_topk,
+                                scale=self.scale,
+                                kvr=self.kvr)
+        return ((latent, pooled), (tail, )), self.output(o_lat)
 
 
 def _layer_metadata(attention_metadata, name: str) -> AttentionMetadata:
@@ -347,9 +429,9 @@ class Glm5NextDecoderLayer(JaxModule):
                                    prefix=f"{prefix}.mlp")
 
     def _site(self, name):
-        return (getattr(self, f"hc_{name}_fn").value,
-                getattr(self, f"hc_{name}_scale").value,
-                getattr(self, f"hc_{name}_base").value)
+        return (getattr(self, f"hc_{name}_fn")[...],
+                getattr(self, f"hc_{name}_scale")[...],
+                getattr(self, f"hc_{name}_base")[...])
 
     def __call__(self, kv_cache, streams: jax.Array,
                  attention_metadata: AttentionMetadata):
@@ -415,9 +497,15 @@ class Glm5NextModel(JaxModule):
         for i, layer in enumerate(self.layers):
             name = glm5_next_kv_cache.layer_name(i)
             idx = layer_name_to_kv_cache[name]
-            kv_caches[idx], streams = layer(
-                kv_caches[idx], streams,
-                _layer_metadata(attention_metadata, name))
+            md = _layer_metadata(attention_metadata, name)
+            if layer.is_kda:
+                kv_caches[idx], streams = layer(kv_caches[idx], streams, md)
+                continue
+            tail_name = glm5_next_kv_cache.indexer_tail_name(i)
+            tidx = layer_name_to_kv_cache[tail_name]
+            (kv_caches[idx], kv_caches[tidx]), streams = layer(
+                (kv_caches[idx], kv_caches[tidx]), streams,
+                (md, _layer_metadata(attention_metadata, tail_name)))
         return kv_caches, self.norm(mhc.mhc_head(streams))
 
 
@@ -475,12 +563,7 @@ class Glm5NextForCausalLM(JaxModule, LoadableWithIterator):
             return not (m and int(m.group(1)) >= num_layers)
 
         weights = ((n, w) for n, w in mapper.apply(weights) if keep(n))
-        # TODO(GLM-5.3-Flash M4): build the sparse indexer and load its
-        # weights; until then MLA attends densely (exact while a request's
-        # context fits in index_topk).
-        loader = JaxAutoWeightsLoader(self,
-                                      skip_prefixes=["model.visual."],
-                                      skip_substrs=[".self_attn.indexer."])
+        loader = JaxAutoWeightsLoader(self, skip_prefixes=["model.visual."])
         return loader.load_weights(weights)
 
 
