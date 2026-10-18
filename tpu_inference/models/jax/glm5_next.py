@@ -27,6 +27,7 @@ dense and expert MLPs) get the FP8 quant config; everything else is
 unquantized.
 """
 import functools
+import math
 import re
 from typing import Any, Iterable, List, Optional, Tuple
 
@@ -525,6 +526,16 @@ class Glm5NextForCausalLM(JaxModule, LoadableWithIterator):
         if vllm_config.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "pipeline parallelism is not supported for GLM-5.3-Flash")
+        # The KDA / MLA / indexer ops read the single-rank metadata layout;
+        # with data-parallel attention the runner packs one segment per rank.
+        axes = ShardingAxisName.ATTN_DATA
+        axes = (axes, ) if isinstance(axes, str) else axes
+        attn_data = math.prod(mesh.shape.get(a, 1) for a in axes)
+        if attn_data > 1:
+            raise NotImplementedError(
+                f"GLM-5.3-Flash does not support data-parallel attention yet "
+                f"(attention data size {attn_data}); set "
+                '"attn_dp_size": 1 in the sharding_strategy')
         self.model = Glm5NextModel(vllm_config, rng, mesh, prefix="model")
         self.lm_head = JaxLmHead(hidden_size=config.hidden_size,
                                  vocab_size=model_config.get_vocab_size(),

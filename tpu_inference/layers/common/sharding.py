@@ -286,8 +286,11 @@ class ShardingConfigManager:
                 # Otherwise, shard KV heads over the expert axis.
                 # Use the remaining KV heads per device as the divisor.
                 shard_divisor = num_kv_heads_per_device_in_kv_cache // tensor_parallelism
-                attn_dp_expert = max(1,
-                                     int(expert_parallelism // shard_divisor))
+                # Fewer KV heads than TP (an explicit attn_dp_size of 1 with
+                # MLA): nothing is left to shard over the expert axis.
+                attn_dp_expert = max(
+                    1, int(expert_parallelism //
+                           shard_divisor)) if shard_divisor >= 1 else 1
                 expert_parallelism //= attn_dp_expert
 
         else:
