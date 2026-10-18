@@ -158,9 +158,9 @@ def sparse_nope_mla(q_lat,
     running top-K, for only as many chunks as the block's queries can see:
     the cost follows the context, not max_model_len. None scores all the
     pools a request can hold at once (the reference path).
-    select_shard: (axis name, size) inside a shard_map whose shards all
-    attend to the same queries (the head shards): each shard selects for
-    T / size of the queries and the token ids are all-gathered over the axis.
+    select_shard: (axis name, size) inside a shard_map whose shards hold the
+    same queries with different heads (the head shards): the shards split the
+    queries for both the selection and the attention.
     """
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
@@ -175,11 +175,19 @@ def sparse_nope_mla(q_lat,
                             index_topk=index_topk,
                             pool_chunk=pool_chunk,
                             query_block=select_block)
+    att = functools.partial(attend,
+                            latent=latent,
+                            bt=bt,
+                            scale=scale,
+                            kvr=kvr,
+                            query_block=attend_block)
     if select_shard is None:
-        tok = sel(qi, wts, req, positions)
+        out = att(q_lat, tok=sel(qi, wts, req, positions), req=req)
     else:
-        # every head shard selects for its slice of the queries; the token ids
-        # are all-gathered (all shards need every query's tokens)
+        # The head shards split the queries: each selects for, and attends
+        # for, its slice of T / n queries across all heads (q_lat comes in
+        # head-sharded and goes back that way through all-to-alls), so each
+        # shard gathers only its queries' latents.
         axis, n = select_shard
         Ts = T // n
         i = lax.axis_index(axis)
@@ -188,15 +196,9 @@ def sparse_nope_mla(q_lat,
             return lax.dynamic_slice_in_dim(x, i * Ts, Ts, axis=0)
 
         tok = sel(part(qi), part(wts), part(req), part(positions))
-        tok = lax.all_gather(tok, axis, axis=0, tiled=True)
-    out = attend(q_lat,
-                 latent,
-                 tok,
-                 req,
-                 bt,
-                 scale=scale,
-                 kvr=kvr,
-                 query_block=attend_block)
+        q_all = lax.all_to_all(q_lat, axis, 0, 1, tiled=True)  # [Ts, H*n]
+        out = att(q_all, tok=tok, req=part(req))
+        out = lax.all_to_all(out, axis, 1, 0, tiled=True)  # [T, H]
     return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
 
 
@@ -276,10 +278,11 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
     return tok.reshape(-1, tok.shape[-1])[:T]
 
 
-def attend(q_lat, latent, tok, req, bt, *, scale: float, kvr: int,
+def attend(q_lat, *, latent, tok, req, bt, scale: float, kvr: int,
            query_block: int):
     """Softmax attention of every query over its selected tokens' latents
-    (K = V = c). tok [T, W] from select_tokens. Returns [T, H, kvr] f32."""
+    (K = V = c). tok [T, W] from select_tokens. Returns [T, H, kvr] f32.
+    The latents are gathered in the cache dtype (f32 accumulation)."""
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
     flat_latent = latent.reshape(num_pages, page_size, width)
@@ -292,10 +295,17 @@ def attend(q_lat, latent, tok, req, bt, *, scale: float, kvr: int,
         ok = tok_b >= 0
         t = jnp.maximum(tok_b, 0)
         page = jnp.take_along_axis(pages, t // page_size, axis=1)
-        keys = flat_latent[page, t % page_size, :kvr].astype(f32)
-        s = jnp.einsum("thr,twr->thw", q_b.astype(f32), keys) * scale
+        keys = flat_latent[page, t % page_size, :kvr]  # [Tb, W, kvr]
+        s = jnp.einsum("thr,twr->thw",
+                       q_b.astype(keys.dtype),
+                       keys,
+                       preferred_element_type=f32) * scale
         s = jnp.where(ok[:, None], s, lo)
-        return jnp.einsum("thw,twr->thr", jax.nn.softmax(s, -1), keys)
+        p = jax.nn.softmax(s, -1)
+        return jnp.einsum("thw,twr->thr",
+                          p.astype(keys.dtype),
+                          keys,
+                          preferred_element_type=f32)
 
     query_block = min(query_block, T)
     pad = (-T) % query_block
