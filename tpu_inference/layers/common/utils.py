@@ -16,6 +16,7 @@ from contextlib import nullcontext
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, Sharding
 
@@ -151,6 +152,12 @@ def general_device_put(tensor: jax.Array,
         # NOTE: at here, num_global_devices != num_local_devices
         # meaning we are in multi-host setup. Each host will run the same process
         # and each process only need to handle the devices accessible to this host.
+        if source_mesh is None and isinstance(t, jax.Array) and all(
+                d.platform == "cpu" for d in t.devices()):
+            # A host-resident array (e.g. weights processed under
+            # cpu_mesh_context) is sliced as numpy: `t[index]` would otherwise
+            # run under the caller's TPU mesh and reject the CPU input.
+            t = np.asarray(t)
         ctx = nullcontext() if source_mesh is None else jax.set_mesh(
             source_mesh)
         # `t[i]` needs to be operated in the same mesh as `t`, which is provided as
@@ -175,7 +182,9 @@ def general_device_put(tensor: jax.Array,
 def cpu_mesh() -> Mesh:
     global _cpu_mesh
     if _cpu_mesh is None:
-        _cpu_mesh = Mesh(jax.devices("cpu")[:1], ("cpu", ))
+        # This process's CPU: in multi-controller JAX, jax.devices("cpu")
+        # starts with process 0's.
+        _cpu_mesh = Mesh(jax.local_devices(backend="cpu")[:1], ("cpu", ))
     return _cpu_mesh
 
 
