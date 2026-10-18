@@ -108,6 +108,20 @@ def _token_sharded(fn, mesh, n_token_args, n_token_outs):
     return wrapped
 
 
+def _default_precision(fn):
+    """The kernels emulate an f32 product with three bf16 passes; a caller's
+    `jax.default_matmul_precision("highest")` would make Mosaic lower their bf16
+    dots at fp32 contract precision, which it rejects."""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with jax.default_matmul_precision("default"):
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
+@_default_precision
 def _kernel_pre(streams, fn, scale, base, cfg: MHCConfig, mesh):
     from tpu_inference.kernels.experimental.deepseek_v4.mhc import pre_kernel
     run = functools.partial(pre_kernel.mhc_pre,
@@ -123,6 +137,7 @@ def _kernel_pre(streams, fn, scale, base, cfg: MHCConfig, mesh):
     return post[..., 0], comb, x
 
 
+@_default_precision
 def _kernel_post(y, streams, post, comb, mesh):
     from tpu_inference.kernels.experimental.deepseek_v4.mhc import post_kernel
     return _token_sharded(post_kernel.mhc_post, mesh, 4,
@@ -130,6 +145,7 @@ def _kernel_post(y, streams, post, comb, mesh):
                              comb)
 
 
+@_default_precision
 def _kernel_post_pre(y, streams, post, comb, fn, scale, base, cfg: MHCConfig,
                      mesh):
     from tpu_inference.kernels.experimental.deepseek_v4.mhc import \

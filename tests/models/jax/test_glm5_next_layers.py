@@ -27,7 +27,12 @@ from jax.sharding import Mesh  # noqa: E402
 pytest.importorskip("transformers.models.glm5_next")
 
 from vllm.config import VllmConfig  # noqa: E402
-from vllm.config import ParallelConfig, set_current_vllm_config
+from vllm.config import (
+    CacheConfig,
+    ModelConfig,  # noqa: E402
+    ParallelConfig,
+    SchedulerConfig,
+    set_current_vllm_config)
 
 from tests.models.jax.glm5_next_ref import make_tiny_ckpt as MT  # noqa: E402
 from tests.models.jax.glm5_next_ref import ref_checkpoint as RC  # noqa: E402
@@ -77,6 +82,30 @@ def _mesh(tp=1):
     return Mesh(
         np.array(jax.devices()[:tp]).reshape(1, 1, 1, 1, tp, 1, 1),
         MESH_AXIS_NAMES)
+
+
+def _vllm_config(model_dir):
+    """A full VllmConfig for the tiny checkpoint, in the production
+    configuration for MLA models on TPU (the TPU platform's config check runs on
+    TPU hosts and needs a model config)."""
+    return VllmConfig(model_config=ModelConfig(model=model_dir,
+                                               skip_tokenizer_init=True,
+                                               dtype="float32",
+                                               max_model_len=256),
+                      cache_config=CacheConfig(block_size=16,
+                                               enable_prefix_caching=False),
+                      scheduler_config=SchedulerConfig(
+                          max_num_seqs=4,
+                          max_model_len=256,
+                          is_encoder_decoder=False),
+                      parallel_config=ParallelConfig(),
+                      additional_config={
+                          "sharding": {
+                              "sharding_strategy": {
+                                  "enable_dp_attention": True
+                              }
+                          }
+                      })
 
 
 class _Root(JaxModule):
@@ -236,7 +265,7 @@ def test_moe_matches_reference(tiny, tp, monkeypatch):
         monkeypatch.setattr(fused_moe_gmm, "gmm_wrapper", _fake_gmm)
     d, text, ref, rcfg = tiny
     mesh = _mesh(tp)
-    with set_current_vllm_config(VllmConfig(parallel_config=ParallelConfig())):
+    with set_current_vllm_config(_vllm_config(d)):
         with jax.set_mesh(mesh):
             moe = G.Glm5NextMoE(text, jnp.float32, nnx.Rngs(0), mesh, None,
                                 f"layers.{MOE_LAYER}.mlp")
