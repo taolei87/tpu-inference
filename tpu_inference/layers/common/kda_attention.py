@@ -58,7 +58,32 @@ def has_initial_state_from_lens(query_start_loc: jax.Array,
     return (seq_lens - query_lens) > 0
 
 
-def _kda_chunk_step(S, q, k, v, g, beta):
+def _decay_mix(x, y, gc, sub):
+    """M[h, i, j] = sum_d x[h, i, d] y[h, j, d] exp(gc[h, i, d] - gc[h, j, d])
+    for j <= i (zero above the diagonal); gc [H, c, d] non-increasing in i.
+
+    Sub-chunks of `sub` positions: across sub-chunks the decay is factored
+    through the start s of row i's sub-chunk, exp(gc_i - gc_s) and
+    exp(gc_s - gc_j), both <= 1 (no overflow at any decay rate) so the block
+    is a matmul; within a sub-chunk it is formed exactly, on [sub, sub, d].
+    """
+    H, c, d = x.shape
+    n = c // sub
+    xs, ys, gs = (a.reshape(H, n, sub, d) for a in (x, y, gc))
+    ref = gs[:, :, :1, :]  # [H, n, 1, d]: gc at each sub-chunk's start
+    left = xs * jnp.exp(gs - ref)  # [H, n, sub, d]
+    right = y[:, None] * jnp.exp(jnp.minimum(ref - gc[:, None], 0.0))
+    off = jnp.einsum("hnid,hnjd->hnij", left, right).reshape(H, c, c)
+    blk = jnp.arange(c) // sub
+    off = jnp.where(blk[:, None] > blk[None, :], off, 0.0)
+    dd = jnp.exp(jnp.minimum(gs[:, :, :, None] - gs[:, :, None], 0.0))
+    diag = jnp.einsum("hnid,hnjd,hnijd->hnij", xs, ys, dd)  # [H, n, sub, sub]
+    diag = jnp.einsum("hnij,nm->hnimj", diag,
+                      jnp.eye(n, dtype=diag.dtype)).reshape(H, c, c)
+    return off + jnp.where(jnp.tril(jnp.ones((c, c), bool)), diag, 0.0)
+
+
+def _kda_chunk_step(S, q, k, v, g, beta, sub: int = 16):
     """One chunk of the chunked KDA form for all heads.
 
     S [H, dk, dv] f32 (the state before the chunk); q, k [H, c, dk] (q already
@@ -68,21 +93,18 @@ def _kda_chunk_step(S, q, k, v, g, beta):
     """
     c = q.shape[1]
     gc = jnp.cumsum(g, axis=1)  # [H, c, dk], <= 0, non-increasing
-    # decay[h, i, j, d] = exp(gc_i - gc_j) for i >= j; the upper triangle is
-    # never used and is clamped so it cannot overflow.
-    decay = jnp.exp(jnp.minimum(gc[:, :, None, :] - gc[:, None, :, :], 0.0))
+    sub = sub if c % sub == 0 else c
     strict = jnp.tril(jnp.ones((c, c), bool), k=-1)
-    incl = jnp.tril(jnp.ones((c, c), bool))
     k_beta = k * beta[..., None]
-    a = jnp.einsum("hid,hjd,hijd->hij", k_beta, k, decay)
-    a = jnp.where(strict, a, 0.0)
+    # a[i, j] = sum_d k_beta_i k_j exp(gc_i - gc_j), strictly lower
+    a = jnp.where(strict, _decay_mix(k_beta, k, gc, sub), 0.0)
     eye = jnp.eye(c, dtype=jnp.float32)
     # T = (I + A)^-1 with A strictly lower (the WY representation).
     t = jax.vmap(lambda m: jax.scipy.linalg.solve_triangular(
         m, eye, lower=True, unit_diagonal=True))(eye + a)
     u = t @ (v * beta[..., None])  # [H, c, dv]
     w = t @ (k_beta * jnp.exp(gc))  # [H, c, dk]
-    attn = jnp.where(incl, jnp.einsum("hid,hjd,hijd->hij", q, k, decay), 0.0)
+    attn = _decay_mix(q, k, gc, sub)  # lower triangle incl. the diagonal
     v_new = u - w @ S
     out = (q * jnp.exp(gc)) @ S + attn @ v_new
     g_last = gc[:, -1, :]  # [H, dk]

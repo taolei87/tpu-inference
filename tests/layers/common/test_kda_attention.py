@@ -261,3 +261,26 @@ def test_sharded_matches_local(tp):
     assert _rel(core, core_l) < 1e-5
     assert _rel(rec, rec_l) < 1e-5
     assert _rel(conv, interleave(conv_l, 2)) < 1e-6
+
+
+@pytest.mark.parametrize("sub", [8, 16])
+@pytest.mark.parametrize("scale", [0.1, 5.0])
+def test_decay_mix_matches_float64(sub, scale):
+    """The sub-chunked decay product against a float64 reference, up to the
+    gate's lower bound (-5 per token: -320 over a 64-token chunk, far past
+    f32 exp range), with no inf / nan."""
+    from tpu_inference.layers.common.kda_attention import _decay_mix
+    rng = np.random.default_rng(0)
+    H, c, d = 2, 64, 32
+    x = rng.standard_normal((H, c, d))
+    y = rng.standard_normal((H, c, d))
+    g = -scale * rng.random((H, c, d))
+    gc = np.cumsum(g, axis=1)
+    ref = np.einsum("hid,hjd,hijd->hij", x, y,
+                    np.exp(np.minimum(gc[:, :, None] - gc[:, None], 0)))
+    ref = np.where(np.tril(np.ones((c, c), bool)), ref, 0)
+    out = np.asarray(
+        _decay_mix(jnp.asarray(x, jnp.float32), jnp.asarray(y, jnp.float32),
+                   jnp.asarray(gc, jnp.float32), sub))
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out, ref, rtol=2e-4, atol=2e-4)
