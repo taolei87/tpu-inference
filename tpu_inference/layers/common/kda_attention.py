@@ -83,19 +83,25 @@ def _decay_mix(x, y, gc, sub):
     return off + jnp.where(jnp.tril(jnp.ones((c, c), bool)), diag, 0.0)
 
 
-def _unit_lower_inverse(a, blk):
+def _unit_lower_inverse(a, blk=8):
     """(I + a)^-1 for strictly lower a [H, c, c], by block forward
-    substitution: the blk x blk diagonal blocks are solved (triangular
-    solves of depth blk instead of c), the blocks below them follow by
-    matmuls, X[i, :i] = -D_i (L[i, :i] X[:i, :i])."""
+    substitution: the inverses D_i of the blk x blk diagonal blocks, then the
+    blocks below them by matmuls, X[i, :i] = -D_i (L[i, :i] X[:i, :i])."""
     H, c, _ = a.shape
     n = c // blk
     eye = jnp.eye(blk, dtype=a.dtype)
     lb = a.reshape(H, n, blk, n, blk)
     diag = jnp.stack([lb[:, i, :, i] for i in range(n)], 1)  # [H, n, b, b]
-    d_inv = jax.vmap(
-        jax.vmap(lambda m: jax.scipy.linalg.solve_triangular(
-            m + eye, eye, lower=True, unit_diagonal=True)))(diag)
+    # Diagonal blocks without a triangular solve (a TPU custom call with a
+    # large fixed cost): for strictly lower N of size b, N^b = 0 and
+    # (I - N)^-1 = (I + N)(I + N^2)(I + N^4)... exactly; at b = 8 the powers
+    # grow at most by C(7, 3) = 35, harmless in f32.
+    nn = -diag
+    d_inv = eye + nn
+    p = nn
+    for _ in range(max(1, (blk - 1).bit_length()) - 1):
+        p = p @ p
+        d_inv = d_inv + d_inv @ p
     rows = [
         jnp.concatenate([d_inv[:, 0]] +
                         [jnp.zeros_like(eye)[None].repeat(H, 0)] * (n - 1), -1)
@@ -127,7 +133,7 @@ def _kda_chunk_step(S, q, k, v, g, beta, sub: int = 16):
     # a[i, j] = sum_d k_beta_i k_j exp(gc_i - gc_j), strictly lower
     a = jnp.where(strict, _decay_mix(k_beta, k, gc, sub), 0.0)
     # T = (I + A)^-1 with A strictly lower (the WY representation).
-    t = _unit_lower_inverse(a, sub)
+    t = _unit_lower_inverse(a, 8 if c % 8 == 0 else c)
     u = t @ (v * beta[..., None])  # [H, c, dv]
     w = t @ (k_beta * jnp.exp(gc))  # [H, c, dk]
     attn = _decay_mix(q, k, gc, sub)  # lower triangle incl. the diagonal
