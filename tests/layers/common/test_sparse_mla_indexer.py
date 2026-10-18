@@ -89,3 +89,18 @@ def test_streaming_reads_only_visible_chunks():
                                np.asarray(out)[t0:t1],
                                rtol=1e-6,
                                atol=1e-6)
+
+
+@pytest.mark.parametrize("pool_chunk", [None, 8])
+def test_shared_key_gather_matches_per_query(pool_chunk):
+    """Blocks of one request gather the pooled keys once (select_block 1:
+    every block); blocks spanning requests gather them per query (one block
+    for the whole step). Same selection."""
+    args = _inputs(2, True)
+    kw = dict(index_topk=32, scale=KVR**-0.5, kvr=KVR, pool_chunk=pool_chunk)
+    shared = sparse_nope_mla(*args, **kw, select_block=1)
+    per_query = sparse_nope_mla(*args, **kw, select_block=64)
+    np.testing.assert_allclose(np.asarray(shared),
+                               np.asarray(per_query),
+                               rtol=1e-6,
+                               atol=1e-6)

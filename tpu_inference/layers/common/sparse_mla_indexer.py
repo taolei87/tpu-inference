@@ -216,11 +216,27 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
     lo = jnp.finfo(jnp.float32).min
     f32 = jnp.float32
 
-    def scores(qi_b, w_b, pages, first_pool, pos_b):
+    def scores(qi_b, w_b, pages, first_pool, pos_b, same):
+        """same: every query of the block is of one request (pages[0]'s)
+        -> its pooled keys are gathered once for the block."""
         n = pages.shape[1] * prows
-        pk = pooled[pages].reshape(-1, n, ihd).astype(f32)  # [Tb, n, ihd]
-        sc = jax.nn.relu(jnp.einsum("thd,tpd->thp", qi_b, pk) * ihd**-0.5)
-        sc = jnp.einsum("th,thp->tp", w_b, sc)
+
+        def shared():
+            pk = pooled[pages[0]].reshape(n, ihd)
+            return jnp.einsum("thd,pd->thp",
+                              qi_b.astype(pk.dtype),
+                              pk,
+                              preferred_element_type=f32)
+
+        def per_query():
+            pk = pooled[pages].reshape(-1, n, ihd)  # [Tb, n, ihd]
+            return jnp.einsum("thd,tpd->thp",
+                              qi_b.astype(pk.dtype),
+                              pk,
+                              preferred_element_type=f32)
+
+        sc = lax.cond(same, shared, per_query)
+        sc = jnp.einsum("th,thp->tp", w_b, jax.nn.relu(sc * ihd**-0.5))
         ids = first_pool + jnp.arange(n)
         visible = ids[None] * kp + kp - 1 <= pos_b[:, None]
         return jnp.where(visible, sc, lo), ids
@@ -232,8 +248,9 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
         bt_pad = jnp.pad(bt, ((0, 0), (0, n_chunks * cpages - pps)))
 
     def select(qi_b, w_b, req_b, pos_b):
+        same = jnp.all(req_b == req_b[0])
         if not stream:
-            sc, _ = scores(qi_b, w_b, bt[req_b], 0, pos_b)
+            sc, _ = scores(qi_b, w_b, bt[req_b], 0, pos_b, same)
             return top_k(sc, K)
         pages = bt_pad[req_b]  # [Tb, n_chunks * cpages]
         Tb = pages.shape[0]
@@ -241,7 +258,7 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
         def body(j, carry):
             vals, idx = carry
             pg = lax.dynamic_slice_in_dim(pages, j * cpages, cpages, axis=1)
-            sc, ids = scores(qi_b, w_b, pg, j * cpages * prows, pos_b)
+            sc, ids = scores(qi_b, w_b, pg, j * cpages * prows, pos_b, same)
             # running entries first: ties keep the lowest pool id, as one
             # top_k over all the pools would
             cv = jnp.concatenate([vals, sc], -1)
