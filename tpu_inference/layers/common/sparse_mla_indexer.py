@@ -37,6 +37,8 @@ Caches (see `runner/glm5_next_kv_cache.py`):
 These are the correctness implementations: queries run in blocks of
 `query_block`, each gathering its request's pooled keys.
 """
+import functools
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -46,6 +48,7 @@ from tpu_inference.layers.common.nope_mla_attention import (_cache_dims,
                                                             _token_requests,
                                                             write_latents)
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.utils import get_mesh_shape_product
 
 
 def top_k(x, k, chunk=None):
@@ -140,7 +143,8 @@ def sparse_nope_mla(q_lat,
                     scale: float,
                     kvr: int,
                     query_block: int = 8,
-                    pool_chunk: int | None = 2048):
+                    pool_chunk: int | None = 2048,
+                    select_shard: tuple | None = None):
     """Indexer selection + attention over the selected tokens' latents.
 
     q_lat [T, H, kvr]; qi [T, IH, ihd] and wts [T, IH] (f32; wts already
@@ -151,18 +155,59 @@ def sparse_nope_mla(q_lat,
     running top-K, for only as many chunks as the block's queries can see:
     the cost follows the context, not max_model_len. None scores all the
     pools a request can hold at once (the reference path).
+    select_shard: (axis name, size) inside a shard_map whose shards all
+    attend to the same queries (the head shards): each shard selects for
+    T / size of the queries and the token ids are all-gathered over the axis.
     """
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
-    _, prows, ihd = pooled.shape
-    kp = page_size // prows
     req, valid, _, pps = _step_info(positions, block_tables, seq_lens,
                                     query_start_loc, distribution, page_size)
     max_reqs = query_start_loc.shape[0] - 1
     bt = block_tables.reshape(max_reqs, pps)
+    sel = functools.partial(select_tokens,
+                            pooled=pooled,
+                            bt=bt,
+                            page_size=page_size,
+                            index_topk=index_topk,
+                            pool_chunk=pool_chunk,
+                            query_block=query_block)
+    if select_shard is None:
+        tok = sel(qi, wts, req, positions)
+    else:
+        # every head shard selects for its slice of the queries; the token ids
+        # are all-gathered (all shards need every query's tokens)
+        axis, n = select_shard
+        Ts = T // n
+        i = lax.axis_index(axis)
+
+        def part(x):
+            return lax.dynamic_slice_in_dim(x, i * Ts, Ts, axis=0)
+
+        tok = sel(part(qi), part(wts), part(req), part(positions))
+        tok = lax.all_gather(tok, axis, axis=0, tiled=True)
+    out = attend(q_lat,
+                 latent,
+                 tok,
+                 req,
+                 bt,
+                 scale=scale,
+                 kvr=kvr,
+                 query_block=query_block)
+    return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
+
+
+def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
+                  index_topk: int, pool_chunk, query_block: int):
+    """The indexer's choice for every query: [T, W] token positions of its
+    request (its top index_topk // kpool pools' tokens, then its own
+    incomplete pool), -1 where a slot is unused."""
+    T = qi.shape[0]
+    _, prows, ihd = pooled.shape
+    kp = page_size // prows
+    pps = bt.shape[1]
     P = pps * prows  # pools a request can hold
     K = min(index_topk // kp, P)
-    flat_latent = latent.reshape(num_pages, page_size, width)
     lo = jnp.finfo(jnp.float32).min
     f32 = jnp.float32
 
@@ -206,8 +251,7 @@ def sparse_nope_mla(q_lat,
         return lax.fori_loop(0, n, body, init)
 
     def block(args):
-        q_b, qi_b, w_b, req_b, pos_b = args
-        pages = bt[req_b]  # [Tb, pps]
+        qi_b, w_b, req_b, pos_b = args
         vals, pools = select(qi_b, w_b, req_b, pos_b)
         tok = pools[..., None] * kp + jnp.arange(kp)  # [Tb, K, kp]
         tok = jnp.where((vals > lo)[..., None], tok, -1).reshape(-1, K * kp)
@@ -216,11 +260,35 @@ def sparse_nope_mla(q_lat,
         off = jnp.arange(kp - 1)
         tail = jnp.where(start[:, None] + off <= pos_b[:, None],
                          start[:, None] + off, -1)
-        tok = jnp.concatenate([tok, tail], -1)  # [Tb, W]
-        ok = tok >= 0
-        tok = jnp.maximum(tok, 0)
-        page = jnp.take_along_axis(pages, tok // page_size, axis=1)
-        keys = flat_latent[page, tok % page_size, :kvr].astype(f32)
+        return jnp.concatenate([tok, tail], -1).astype(jnp.int32)  # [Tb, W]
+
+    pad = (-T) % query_block
+    args = [
+        jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
+        for x in (qi.astype(f32), wts.astype(f32), req, positions)
+    ]
+    blocks = tuple(x.reshape((-1, query_block) + x.shape[1:]) for x in args)
+    tok = lax.map(block, blocks)
+    return tok.reshape(-1, tok.shape[-1])[:T]
+
+
+def attend(q_lat, latent, tok, req, bt, *, scale: float, kvr: int,
+           query_block: int):
+    """Softmax attention of every query over its selected tokens' latents
+    (K = V = c). tok [T, W] from select_tokens. Returns [T, H, kvr] f32."""
+    T, H, _ = q_lat.shape
+    num_pages, page_size, packing, width = _cache_dims(latent)
+    flat_latent = latent.reshape(num_pages, page_size, width)
+    lo = jnp.finfo(jnp.float32).min
+    f32 = jnp.float32
+
+    def block(args):
+        q_b, tok_b, req_b = args
+        pages = bt[req_b]  # [Tb, pps]
+        ok = tok_b >= 0
+        t = jnp.maximum(tok_b, 0)
+        page = jnp.take_along_axis(pages, t // page_size, axis=1)
+        keys = flat_latent[page, t % page_size, :kvr].astype(f32)
         s = jnp.einsum("thr,twr->thw", q_b.astype(f32), keys) * scale
         s = jnp.where(ok[:, None], s, lo)
         return jnp.einsum("thw,twr->thr", jax.nn.softmax(s, -1), keys)
@@ -228,11 +296,10 @@ def sparse_nope_mla(q_lat,
     pad = (-T) % query_block
     args = [
         jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
-        for x in (q_lat, qi.astype(f32), wts.astype(f32), req, positions)
+        for x in (q_lat, tok, req)
     ]
     blocks = tuple(x.reshape((-1, query_block) + x.shape[1:]) for x in args)
-    out = lax.map(block, blocks).reshape(-1, H, kvr)[:T]
-    return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
+    return lax.map(block, blocks).reshape(-1, H, kvr)[:T]
 
 
 def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
@@ -252,10 +319,15 @@ def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
     """
     D, H = ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD
     B, CTX = ShardingAxisName.BATCH, ShardingAxisName.KV_CONTEXT
+    n_head_shards = get_mesh_shape_product(mesh, H)
 
     def local(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts, positions,
               block_tables, seq_lens, query_start_loc, distribution,
               tail_slots):
+        # the indexer's selection is the same for every head shard: split it
+        # over them by query instead of repeating it
+        split = n_head_shards > 1 and positions.shape[0] % n_head_shards == 0
+        shard = (H, n_head_shards) if split else None
         latent = write_latents(latent, c, positions, block_tables,
                                query_start_loc, distribution)
         pooled, tail = indexer_write(pooled, tail, k, gate, ape, positions,
@@ -273,7 +345,8 @@ def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
                                 distribution,
                                 index_topk=index_topk,
                                 scale=scale,
-                                kvr=kvr)
+                                kvr=kvr,
+                                select_shard=shard)
         return latent, pooled, tail, o_lat
 
     tok = P(D, None)
