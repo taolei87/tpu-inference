@@ -83,6 +83,34 @@ def _decay_mix(x, y, gc, sub):
     return off + jnp.where(jnp.tril(jnp.ones((c, c), bool)), diag, 0.0)
 
 
+def _unit_lower_inverse(a, blk):
+    """(I + a)^-1 for strictly lower a [H, c, c], by block forward
+    substitution: the blk x blk diagonal blocks are solved (triangular
+    solves of depth blk instead of c), the blocks below them follow by
+    matmuls, X[i, :i] = -D_i (L[i, :i] X[:i, :i])."""
+    H, c, _ = a.shape
+    n = c // blk
+    eye = jnp.eye(blk, dtype=a.dtype)
+    lb = a.reshape(H, n, blk, n, blk)
+    diag = jnp.stack([lb[:, i, :, i] for i in range(n)], 1)  # [H, n, b, b]
+    d_inv = jax.vmap(
+        jax.vmap(lambda m: jax.scipy.linalg.solve_triangular(
+            m + eye, eye, lower=True, unit_diagonal=True)))(diag)
+    rows = [
+        jnp.concatenate([d_inv[:, 0]] +
+                        [jnp.zeros_like(eye)[None].repeat(H, 0)] * (n - 1), -1)
+    ]  # block row 0: [H, b, c]
+    for i in range(1, n):
+        x_prev = jnp.concatenate(rows, 1)[:, :, :i * blk]  # X[:i, :i]
+        l_row = a[:, i * blk:(i + 1) * blk, :i * blk]  # L[i, :i]
+        below = -d_inv[:, i] @ (l_row @ x_prev)  # [H, b, i * b]
+        rows.append(
+            jnp.concatenate([below, d_inv[:, i]] +
+                            [jnp.zeros(
+                                (H, blk, (n - 1 - i) * blk), a.dtype)], -1))
+    return jnp.concatenate(rows, 1)
+
+
 def _kda_chunk_step(S, q, k, v, g, beta, sub: int = 16):
     """One chunk of the chunked KDA form for all heads.
 
@@ -98,10 +126,8 @@ def _kda_chunk_step(S, q, k, v, g, beta, sub: int = 16):
     k_beta = k * beta[..., None]
     # a[i, j] = sum_d k_beta_i k_j exp(gc_i - gc_j), strictly lower
     a = jnp.where(strict, _decay_mix(k_beta, k, gc, sub), 0.0)
-    eye = jnp.eye(c, dtype=jnp.float32)
     # T = (I + A)^-1 with A strictly lower (the WY representation).
-    t = jax.vmap(lambda m: jax.scipy.linalg.solve_triangular(
-        m, eye, lower=True, unit_diagonal=True))(eye + a)
+    t = _unit_lower_inverse(a, sub)
     u = t @ (v * beta[..., None])  # [H, c, dv]
     w = t @ (k_beta * jnp.exp(gc))  # [H, c, dk]
     attn = _decay_mix(q, k, gc, sub)  # lower triangle incl. the diagonal
