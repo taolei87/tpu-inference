@@ -25,12 +25,9 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 from jax.sharding import Mesh, PartitionSpec  # noqa: E402
-from vllm.config import (
-    CacheConfig,
-    ModelConfig,  # noqa: E402
-    ParallelConfig,
-    SchedulerConfig,
-    VllmConfig)
+from vllm.config import ModelConfig  # noqa: E402
+from vllm.config import (CacheConfig, ParallelConfig, SchedulerConfig,
+                         VllmConfig)
 from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
@@ -47,6 +44,21 @@ REAL_CONFIG = os.path.join(os.path.dirname(__file__), "..", "models", "jax",
 BLOCK_SIZE = 64
 MAX_REQS = 8
 HBM_PER_DEVICE = 8 << 30
+
+# MLA models on TPU run with the new model design and attention DP (enforced by
+# the TPU platform's config check, which is active on TPU hosts).
+_GLM_ADDITIONAL_CONFIG = {
+    "sharding": {
+        "sharding_strategy": {
+            "enable_dp_attention": True
+        }
+    }
+}
+
+
+@pytest.fixture(autouse=True)
+def _new_model_design(monkeypatch):
+    monkeypatch.setenv("NEW_MODEL_DESIGN", "1")
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +88,7 @@ def _vllm_config(model_dir):
                                          max_model_len=4096,
                                          is_encoder_decoder=False),
         parallel_config=ParallelConfig(),
+        additional_config=_GLM_ADDITIONAL_CONFIG,
     )
 
 

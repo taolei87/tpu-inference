@@ -71,7 +71,10 @@ class Glm5NextMLP(JaxModule):
                  rng: nnx.Rngs,
                  quant_config=None,
                  prefix: str = ""):
-        mlp = ShardingAxisName.MLP_TENSOR
+        # Like DeepSeek-V3's dense MLP: tensor-parallel over ATTN_HEAD, which is
+        # disjoint from the token axis (ATTN_DATA) under attention DP;
+        # MLP_TENSOR overlaps it in the new model design.
+        mlp = ShardingAxisName.ATTN_HEAD
 
         def linear(i, o, sharding, name):
             return JaxLinear(i,

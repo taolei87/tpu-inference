@@ -45,6 +45,12 @@ DENSE_LAYER, MOE_LAYER, MLA_LAYER = 0, 1, 2  # in the tiny model
 
 
 @pytest.fixture(autouse=True)
+def _new_model_design(monkeypatch):
+    """GLM-5.3-Flash (MLA) runs with the new model design's sharding axes."""
+    monkeypatch.setenv("NEW_MODEL_DESIGN", "1")
+
+
+@pytest.fixture(autouse=True)
 def _highest_precision():
     with jax.default_matmul_precision("highest"):
         yield

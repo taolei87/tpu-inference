@@ -44,6 +44,21 @@ from tpu_inference.runner import glm5_next_kv_cache as KV  # noqa: E402
 
 PAGE, PAGES_PER_SEQ, MAX_REQS = 16, 8, 4
 
+# MLA models on TPU run with the new model design and attention DP (enforced by
+# the TPU platform's config check, which is active on TPU hosts).
+_GLM_ADDITIONAL_CONFIG = {
+    "sharding": {
+        "sharding_strategy": {
+            "enable_dp_attention": True
+        }
+    }
+}
+
+
+@pytest.fixture(autouse=True)
+def _new_model_design(monkeypatch):
+    monkeypatch.setenv("NEW_MODEL_DESIGN", "1")
+
 
 @pytest.fixture(autouse=True)
 def _highest_precision_and_cpu_gmm(monkeypatch):
@@ -76,6 +91,7 @@ def _vllm_config(model_dir, dtype="float32"):
                                          max_model_len=PAGE * PAGES_PER_SEQ,
                                          is_encoder_decoder=False),
         parallel_config=ParallelConfig(),
+        additional_config=_GLM_ADDITIONAL_CONFIG,
     )
 
 
