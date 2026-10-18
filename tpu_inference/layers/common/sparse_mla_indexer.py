@@ -139,12 +139,18 @@ def sparse_nope_mla(q_lat,
                     index_topk: int,
                     scale: float,
                     kvr: int,
-                    query_block: int = 8):
+                    query_block: int = 8,
+                    pool_chunk: int | None = 2048):
     """Indexer selection + attention over the selected tokens' latents.
 
     q_lat [T, H, kvr]; qi [T, IH, ihd] and wts [T, IH] (f32; wts already
     scaled by IH^-0.5); the caches must already hold this step's latents and
     completed pools. Returns o_lat [T, H, kvr].
+
+    pool_chunk: score the pools in chunks of about this many, merging a
+    running top-K, for only as many chunks as the block's queries can see:
+    the cost follows the context, not max_model_len. None scores all the
+    pools a request can hold at once (the reference path).
     """
     T, H, _ = q_lat.shape
     num_pages, page_size, packing, width = _cache_dims(latent)
@@ -160,15 +166,49 @@ def sparse_nope_mla(q_lat,
     lo = jnp.finfo(jnp.float32).min
     f32 = jnp.float32
 
+    def scores(qi_b, w_b, pages, first_pool, pos_b):
+        n = pages.shape[1] * prows
+        pk = pooled[pages].reshape(-1, n, ihd).astype(f32)  # [Tb, n, ihd]
+        sc = jax.nn.relu(jnp.einsum("thd,tpd->thp", qi_b, pk) * ihd**-0.5)
+        sc = jnp.einsum("th,thp->tp", w_b, sc)
+        ids = first_pool + jnp.arange(n)
+        visible = ids[None] * kp + kp - 1 <= pos_b[:, None]
+        return jnp.where(visible, sc, lo), ids
+
+    stream = pool_chunk is not None and P > pool_chunk
+    if stream:
+        cpages = max(1, pool_chunk // prows)  # pages per chunk
+        n_chunks = -(-pps // cpages)
+        bt_pad = jnp.pad(bt, ((0, 0), (0, n_chunks * cpages - pps)))
+
+    def select(qi_b, w_b, req_b, pos_b):
+        if not stream:
+            sc, _ = scores(qi_b, w_b, bt[req_b], 0, pos_b)
+            return top_k(sc, K)
+        pages = bt_pad[req_b]  # [Tb, n_chunks * cpages]
+        Tb = pages.shape[0]
+
+        def body(j, carry):
+            vals, idx = carry
+            pg = lax.dynamic_slice_in_dim(pages, j * cpages, cpages, axis=1)
+            sc, ids = scores(qi_b, w_b, pg, j * cpages * prows, pos_b)
+            # running entries first: ties keep the lowest pool id, as one
+            # top_k over all the pools would
+            cv = jnp.concatenate([vals, sc], -1)
+            ci = jnp.concatenate([idx, jnp.broadcast_to(ids, sc.shape)], -1)
+            v, i = lax.top_k(cv, K)
+            return v, jnp.take_along_axis(ci, i, -1)
+
+        # chunks holding at least one complete pool visible from the block
+        visible_pools = (jnp.max(pos_b) + 1) // kp
+        n = jnp.minimum(-(-visible_pools // (cpages * prows)), n_chunks)
+        init = (jnp.full((Tb, K), lo, f32), jnp.zeros((Tb, K), jnp.int32))
+        return lax.fori_loop(0, n, body, init)
+
     def block(args):
         q_b, qi_b, w_b, req_b, pos_b = args
         pages = bt[req_b]  # [Tb, pps]
-        pk = pooled[pages].reshape(-1, P, ihd).astype(f32)  # [Tb, P, ihd]
-        sc = jax.nn.relu(jnp.einsum("thd,tpd->thp", qi_b, pk) * ihd**-0.5)
-        sc = jnp.einsum("th,thp->tp", w_b, sc)
-        visible = jnp.arange(P)[None] * kp + kp - 1 <= pos_b[:, None]
-        sc = jnp.where(visible, sc, lo)
-        vals, pools = top_k(sc, K)
+        vals, pools = select(qi_b, w_b, req_b, pos_b)
         tok = pools[..., None] * kp + jnp.arange(kp)  # [Tb, K, kp]
         tok = jnp.where((vals > lo)[..., None], tok, -1).reshape(-1, K * kp)
         # plus the query's own incomplete pool: positions start .. pos
