@@ -119,3 +119,16 @@ def test_packed_latent_cache_layout():
                                np.asarray(flat),
                                rtol=1e-6,
                                atol=1e-6)
+
+
+def test_row_view_and_native_gathers_agree(monkeypatch):
+    """Large steps gather the latents through a row view of the cache, small
+    ones from the cache layout: the same attention."""
+    from tpu_inference.layers.common import sparse_mla_indexer as SM
+    args = _inputs(4, False)
+    kw = dict(index_topk=32, scale=KVR**-0.5, kvr=KVR, pool_chunk=8)
+    monkeypatch.setattr(SM, "ROW_VIEW_MIN_TOKENS", 1)
+    rows = np.asarray(SM.sparse_nope_mla(*args, **kw))
+    monkeypatch.setattr(SM, "ROW_VIEW_MIN_TOKENS", 10**9)
+    native = np.asarray(SM.sparse_nope_mla(*args, **kw))
+    np.testing.assert_allclose(rows, native, rtol=1e-6, atol=1e-6)
