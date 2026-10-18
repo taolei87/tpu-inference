@@ -439,15 +439,23 @@ class Glm5NextDecoderLayer(JaxModule):
                  attention_metadata: AttentionMetadata):
         """streams [T, hc, D] -> (new kv_cache, new streams)."""
         kw = dict(use_kernel=self.use_mhc_kernel, mesh=self.mesh)
-        post, comb, h = mhc.mhc_pre(streams, *self._site("attn"), self.mhc_cfg,
-                                    **kw)
-        kv_cache, h = self.self_attn(kv_cache, self.input_layernorm(h),
-                                     attention_metadata)
-        streams, post, comb, h = mhc.mhc_post_pre(h, streams, post, comb,
-                                                  *self._site("ffn"),
-                                                  self.mhc_cfg, **kw)
-        h = self.mlp(self.post_attention_layernorm(h))
-        return kv_cache, mhc.mhc_post(h, streams, post, comb, **kw)
+        # named scopes label the ops for profiles
+        attn = "mla" if isinstance(self.self_attn, Glm5NextMLA) else "kda"
+        ffn = "moe" if isinstance(self.mlp, Glm5NextMoE) else "mlp"
+        with jax.named_scope("mhc"):
+            post, comb, h = mhc.mhc_pre(streams, *self._site("attn"),
+                                        self.mhc_cfg, **kw)
+        with jax.named_scope(attn):
+            kv_cache, h = self.self_attn(kv_cache, self.input_layernorm(h),
+                                         attention_metadata)
+        with jax.named_scope("mhc"):
+            streams, post, comb, h = mhc.mhc_post_pre(h, streams, post, comb,
+                                                      *self._site("ffn"),
+                                                      self.mhc_cfg, **kw)
+        with jax.named_scope(ffn):
+            h = self.mlp(self.post_attention_layernorm(h))
+        with jax.named_scope("mhc"):
+            return kv_cache, mhc.mhc_post(h, streams, post, comb, **kw)
 
 
 class Glm5NextModel(JaxModule):
