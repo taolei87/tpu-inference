@@ -124,7 +124,7 @@ class _Caches:
     """The per-layer caches the runner allocates (glm5_next_kv_cache layout)
     and one AttentionMetadata per scheduler step."""
 
-    def __init__(self, text, dtype=jnp.float32, seed=0):
+    def __init__(self, text, dtype=jnp.float32, seed=0, latent_dtype=None):
         lay = KV.Glm5NextCacheLayout.from_config(text, None)
         self.lay = lay
         rng = np.random.default_rng(seed)
@@ -139,7 +139,8 @@ class _Caches:
                 entry = (jnp.zeros((slots, *lay.conv_shape), dtype),
                          jnp.zeros((slots, *lay.state_shape), jnp.float32))
             else:
-                entry = (jnp.zeros((self.num_pages, PAGE, 1, kvr), dtype),
+                entry = (jnp.zeros((self.num_pages, PAGE, 1, kvr), latent_dtype
+                                   or dtype),
                          jnp.zeros(lay.pooled_shape(self.num_pages, PAGE),
                                    dtype))
                 self.index[KV.indexer_tail_name(i)] = len(self.kv_caches) + 1

@@ -94,7 +94,8 @@ def _truncated_view(src: str, dst: str, n: int) -> str:
     return dst
 
 
-def test_truncated_real_checkpoint(tmp_path):
+@pytest.mark.parametrize("latent_dtype", ["bfloat16", "float8_e4m3fn"])
+def test_truncated_real_checkpoint(tmp_path, latent_dtype):
     d = _truncated_view(CKPT, str(tmp_path), N_LAYERS)
     vllm_config = T._vllm_config(d, "bfloat16")
     vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
@@ -121,7 +122,9 @@ def test_truncated_real_checkpoint(tmp_path):
             jax.devices("cpu")[0]):
         ref = T._reference(d, ids)
 
-    caches = T._Caches(text, dtype=jnp.bfloat16)
+    caches = T._Caches(text,
+                       dtype=jnp.bfloat16,
+                       latent_dtype=jnp.dtype(latent_dtype))
     a, b = len(ids[0]), len(ids[1])
     # chunked prefill, then a decode and the prefill remainder
     s1 = T._run(model, mesh, caches, [(0, 0, a - 3), (1, 0, b - 1)], ids)
@@ -134,6 +137,8 @@ def test_truncated_real_checkpoint(tmp_path):
         top1 = (logits.argmax(-1) == ref[r][1].argmax(-1)).mean()
         # measured on v6e (default weight requantization): KL 0.0007 at 5
         # layers, 0.0023 at 12; top-1 >= 0.94
+        print(f"REALCKPT latent={latent_dtype} req={r} kl={kl:.5f} "
+              f"top1={top1:.3f}")
         assert kl < 0.004 * max(1, N_LAYERS / 12), (r, kl)
         assert top1 >= 0.9, (r, top1)
         assert logits[-1].argmax() == ref[r][1][-1].argmax(), r

@@ -335,6 +335,9 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
             off = (pl % ppp)[..., None] * kp + jnp.arange(kp)  # [Tb, n, kp]
             keys = latent[page[..., None], off // packing, off % packing, :kvr]
         keys = keys.reshape(Tb, n * kp, kvr)
+        if jnp.dtype(
+                keys.dtype).itemsize == 1:  # an fp8 cache: compute in bf16
+            keys = keys.astype(jnp.bfloat16)
         tpos = pl[..., None] * kp + jnp.arange(kp)
         ok = (pool_b >= 0)[..., None] & (tpos <= pos_b[:, None, None])
         s = jnp.einsum("thr,twr->thw",
