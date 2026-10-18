@@ -360,3 +360,19 @@ def test_vllm_model_config(which, tiny, tmp_path):
     assert mc.hf_text_config.num_hidden_layers == want["num_hidden_layers"]
     assert mc.hf_text_config.linear_num_heads == want["linear_attn_config"][
         "num_heads"]
+
+
+def test_tiny_checkpoint_perturbs_degenerate_inits(tiny):
+    """Tensors whose transformers init is degenerate (zeros / ones) are
+    perturbed, so the parity tests exercise them (e.g. the router's correction
+    bias, a buffer, steers expert selection)."""
+    d = tiny[0]
+    r = RC.CheckpointReader(d)
+    for suffix in ("mlp.gate.e_score_correction_bias", "A_log", "dt_bias",
+                   "index_kpool_compress_ape", "hc_attn_base",
+                   "input_layernorm.weight"):
+        names = [n for n in r.names() if n.endswith(suffix)]
+        assert names, suffix
+        for n in names:
+            v = r.get(n)
+            assert np.std(v) > 1e-3, n

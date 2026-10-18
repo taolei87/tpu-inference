@@ -470,13 +470,32 @@ class JaxRoutedExperts(JaxModule):
         self,
         x_TD: jax.Array,
         router_logits: jax.Array,
+        *,
+        e_score_correction_bias: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, Optional[jax.Array]]:
+        """`e_score_correction_bias` [E] (DeepSeek-style noaux_tc routing):
+        experts are chosen by score + bias, weighted by the unbiased score.
+        Supported by the GMM backends."""
         assert self.quant_method is not None
+        kwargs = {}
+        if e_score_correction_bias is not None:
+            if self.moe_backend not in (MoEBackend.GMM_EP, MoEBackend.GMM_TP):
+                raise NotImplementedError(
+                    "e_score_correction_bias needs a GMM MoE backend, got "
+                    f"{self.moe_backend}")
+            kwargs["extra_backend_kwargs"] = {
+                "e_score_correction_bias": e_score_correction_bias
+            }
         x_TD = self.quant_method.apply_jax(self,
                                            x_TD,
-                                           router_logits=router_logits)
+                                           router_logits=router_logits,
+                                           **kwargs)
         if self.enable_return_routed_experts:
-            _, selected_experts_TX = jax.lax.top_k(router_logits, self.top_k)
+            scores = router_logits
+            if e_score_correction_bias is not None:
+                scores = jax.nn.sigmoid(router_logits.astype(
+                    jnp.float32)) + e_score_correction_bias
+            _, selected_experts_TX = jax.lax.top_k(scores, self.top_k)
             return x_TD, selected_experts_TX
         return x_TD, None
 

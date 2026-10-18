@@ -219,8 +219,12 @@ class Mxfp4FusedMoEMethod(QuantizeMethodBase):
 
         return True
 
-    def apply_jax(self, layer: JaxModule, x: jax.Array, *,
-                  router_logits: jax.Array) -> jax.Array:
+    def apply_jax(self,
+                  layer: JaxModule,
+                  x: jax.Array,
+                  *,
+                  router_logits: jax.Array,
+                  extra_backend_kwargs: Optional[dict] = None) -> jax.Array:
         """
         Run the forward pass of the MoE layer.
 
@@ -255,8 +259,10 @@ class Mxfp4FusedMoEMethod(QuantizeMethodBase):
             )
 
         return moe_apply(layer, x_TD, router_logits, weights,
-                         layer.moe_backend, layer.mesh,
-                         self.extra_backend_kwargs)
+                         layer.moe_backend, layer.mesh, {
+                             **self.extra_backend_kwargs,
+                             **(extra_backend_kwargs or {})
+                         })
 
 
 class Mxfp4Config(QuantizationConfig):

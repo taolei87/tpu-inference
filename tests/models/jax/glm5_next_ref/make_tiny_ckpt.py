@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
 import os
 
@@ -188,7 +189,9 @@ def build_hf_model(cfg, seed: int = 0):
         t.copy_(torch.randn(t.shape, generator=g) * std + mean)
 
     with torch.no_grad():
-        for name, t in model.named_parameters():
+        # e_score_correction_bias is a buffer, not a parameter: walk both.
+        for name, t in itertools.chain(model.named_parameters(),
+                                       model.named_buffers()):
             if name.endswith("e_score_correction_bias"):
                 normal_(t, 0.1)
             elif name.endswith("A_log"):

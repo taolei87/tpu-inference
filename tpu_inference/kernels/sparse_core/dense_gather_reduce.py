@@ -80,6 +80,8 @@ def is_compatible(
         return False
     if op.shape[0] % reduce_group_size != 0:
         return False
+    if jax.default_backend() != "tpu":  # get_tpu_info() raises off-TPU
+        return False
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
