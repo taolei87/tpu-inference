@@ -142,7 +142,8 @@ def sparse_nope_mla(q_lat,
                     index_topk: int,
                     scale: float,
                     kvr: int,
-                    query_block: int = 8,
+                    select_block: int = 64,
+                    attend_block: int = 32,
                     pool_chunk: int | None = 2048,
                     select_shard: tuple | None = None):
     """Indexer selection + attention over the selected tokens' latents.
@@ -151,6 +152,8 @@ def sparse_nope_mla(q_lat,
     scaled by IH^-0.5); the caches must already hold this step's latents and
     completed pools. Returns o_lat [T, H, kvr].
 
+    select_block / attend_block: queries per step of the selection / the
+    attention (both run as a sequential map over query blocks).
     pool_chunk: score the pools in chunks of about this many, merging a
     running top-K, for only as many chunks as the block's queries can see:
     the cost follows the context, not max_model_len. None scores all the
@@ -171,7 +174,7 @@ def sparse_nope_mla(q_lat,
                             page_size=page_size,
                             index_topk=index_topk,
                             pool_chunk=pool_chunk,
-                            query_block=query_block)
+                            query_block=select_block)
     if select_shard is None:
         tok = sel(qi, wts, req, positions)
     else:
@@ -193,7 +196,7 @@ def sparse_nope_mla(q_lat,
                  bt,
                  scale=scale,
                  kvr=kvr,
-                 query_block=query_block)
+                 query_block=attend_block)
     return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
 
 
@@ -262,6 +265,7 @@ def select_tokens(qi, wts, req, positions, *, pooled, bt, page_size: int,
                          start[:, None] + off, -1)
         return jnp.concatenate([tok, tail], -1).astype(jnp.int32)  # [Tb, W]
 
+    query_block = min(query_block, T)  # small (decode) batches never pad
     pad = (-T) % query_block
     args = [
         jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
@@ -293,6 +297,7 @@ def attend(q_lat, latent, tok, req, bt, *, scale: float, kvr: int,
         s = jnp.where(ok[:, None], s, lo)
         return jnp.einsum("thw,twr->thr", jax.nn.softmax(s, -1), keys)
 
+    query_block = min(query_block, T)
     pad = (-T) % query_block
     args = [
         jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
