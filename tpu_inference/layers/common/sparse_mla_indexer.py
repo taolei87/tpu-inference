@@ -197,27 +197,41 @@ def sparse_nope_mla(q_lat,
         axis, n = select_shard
         Ts = T // n
         i = lax.axis_index(axis)
+        Hl = q_lat.shape[1]
+        # MLA_SELECT_INTERLEAVE: shard i takes queries i, i + n, ... instead
+        # of the i-th contiguous slice (spreads any position-dependent cost)
+        inter = envs.MLA_SELECT_INTERLEAVE
 
         def part(x):
+            if inter:
+                return lax.dynamic_index_in_dim(x.reshape((Ts, n) +
+                                                          x.shape[1:]),
+                                                i,
+                                                axis=1,
+                                                keepdims=False)
             return lax.dynamic_slice_in_dim(x, i * Ts, Ts, axis=0)
+
+        def by_shard(x):  # [T, ...] -> [n (query shard), Ts, ...]
+            if inter:
+                return jnp.swapaxes(x.reshape((Ts, n) + x.shape[1:]), 0, 1)
+            return x.reshape((n, Ts) + x.shape[1:])
+
+        def from_shards(x):  # [n (query shard), Ts, ...] -> [T, ...]
+            if inter:
+                x = jnp.swapaxes(x, 0, 1)
+            return x.reshape((T, ) + x.shape[2:])
 
         pools = sel(part(qi), part(wts), part(req), part(positions))
         # Both all-to-alls split and concatenate the major axis only, with the
-        # head groups moved there locally: on TPU, splitting the head axis
-        # (all_to_all(out, axis, 1, 0)) ran ~20x slower than the major-axis
-        # direction for the same bytes.
-        Hl = q_lat.shape[1]
-        q_all = lax.all_to_all(q_lat.reshape(n, Ts, Hl, -1),
-                               axis,
-                               0,
-                               0,
+        # head groups (or query shards) moved there locally.
+        q_all = lax.all_to_all(by_shard(q_lat), axis, 0, 0,
                                tiled=True)  # [n (head group), Ts, Hl, kvr]
         q_all = q_all.transpose(1, 0, 2, 3).reshape(Ts, n * Hl, -1)
         out = att(q_all, pools=pools, req=part(req), positions=part(positions))
         out = out.reshape(Ts, n, Hl, -1).transpose(1, 0, 2, 3)
         out = lax.all_to_all(out, axis, 0, 0,
-                             tiled=True)  # [n (query slice), Ts, Hl, kvr]
-        out = out.reshape(T, Hl, -1)
+                             tiled=True)  # [n (query shard), Ts, Hl, kvr]
+        out = from_shards(out)
     return jnp.where(valid[:, None, None], out, 0.0).astype(q_lat.dtype)
 
 

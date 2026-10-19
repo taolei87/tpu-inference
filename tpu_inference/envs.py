@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     GMM_DECODE_TILING_MAX_ROWS: int = 1024
     MLA_WHOLE_ROW_GATHER: bool = False
     GLM5_MOE_TOKEN_SPLITS: int = 1
+    MLA_SELECT_INTERLEAVE: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -593,6 +594,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one's GMMs); 1 runs them at once.
     "GLM5_MOE_TOKEN_SPLITS":
     lambda: int(os.getenv("GLM5_MOE_TOKEN_SPLITS") or "1"),
+    # Sparse MLA query-sharded selection: head shard i takes queries i, i + n,
+    # ... instead of the i-th contiguous slice of the step.
+    "MLA_SELECT_INTERLEAVE":
+    env_bool("MLA_SELECT_INTERLEAVE", default=False),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which
