@@ -403,3 +403,32 @@ def test_num_valid_tokens_for_moe_padding():
     if len(devs) >= 2:
         dp = Mesh(devs[:2].reshape(1, 2, 1, 1, 1, 1, 1), MESH_AXIS_NAMES)
         assert _num_valid_tokens(md, dp) is None
+
+
+def test_fp8_fused_expert_all_reduce(tmp_path):
+    """At TP > 1 with fp8 weights the routed and shared experts' partial sums
+    are added and all-reduced once; same output as two all-reduces."""
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=22, fp8=True)
+    vllm_config, model, mesh = _build(d, tp=2, dtype="bfloat16")
+    text = vllm_config.model_config.hf_text_config
+    moes = [
+        layer.mlp for layer in model.model.layers
+        if type(layer.mlp).__name__ == "Glm5NextMoE"
+    ]
+    assert moes and all(m.reduce_axes for m in moes)
+    ids = {0: np.random.default_rng(2).integers(0, text.vocab_size, 12)}
+    with jax.default_matmul_precision("default"):
+        fused = _run(model, mesh, _Caches(text, dtype=jnp.bfloat16),
+                     [(0, 0, 12)], ids)
+        for m in moes:
+            m.reduce_axes = ()
+            m.shared_experts.down_proj.quant_method.linear_config.defer_all_reduce = False
+        split = _run(model, mesh, _Caches(text, dtype=jnp.bfloat16),
+                     [(0, 0, 12)], ids)
+    ref = _reference(d, ids)
+    e_fused, e_split = _rel(fused[0][0],
+                            ref[0][0]), _rel(split[0][0], ref[0][0])
+    print("FUSEDREDUCE", e_fused, e_split, _rel(fused[0][0], split[0][0]))
+    # bf16 rounding of the partial sums: as close to the f32 reference
+    assert e_fused < 1.1 * e_split + 1e-3, (e_fused, e_split)

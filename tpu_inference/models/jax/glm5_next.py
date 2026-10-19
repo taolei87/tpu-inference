@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 from vllm.model_executor.models.utils import WeightsMapper
 
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
@@ -122,6 +123,29 @@ class Glm5NextRouter(JaxModule):
                           precision=jax.lax.Precision.HIGHEST)
 
 
+def _fused_reduce_axes(experts, shared, mesh: Mesh) -> tuple:
+    """The mesh axes to reduce the routed and shared experts' partial sums
+    over in one all-reduce, or () to keep their separate all-reduces: needs
+    the TP GMM backend, no attention DP, blockwise-fp8 shared weights (whose
+    matmul can skip its psum) and the same effective tensor-parallel axes."""
+    from tpu_inference.layers.common.moe import MoEBackend
+    from tpu_inference.layers.jax.quantization.fp8 import \
+        Fp8BlockwiseLinearMethod
+
+    def effective(axes):
+        axes = (axes, ) if isinstance(axes, str) else axes
+        return tuple(a for a in axes if get_mesh_shape_product(mesh, a) > 1)
+
+    if (getattr(experts, "moe_backend", None) != MoEBackend.GMM_TP
+            or get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1
+            or not isinstance(shared.down_proj.quant_method,
+                              Fp8BlockwiseLinearMethod)):
+        return ()
+    gmm, mlp = (effective(ShardingAxisName.MLP_TENSOR),
+                effective(ShardingAxisName.ATTN_HEAD))
+    return gmm if gmm and set(gmm) == set(mlp) else ()
+
+
 class Glm5NextMoE(JaxModule):
 
     def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, mesh: Mesh,
@@ -156,6 +180,14 @@ class Glm5NextMoE(JaxModule):
                                           rng,
                                           quant_config=quant_config,
                                           prefix=f"{prefix}.shared_experts")
+        self.mesh = mesh
+        # One all-reduce for the routed and shared experts together: both
+        # return partial sums over the same tensor-parallel axes, which are
+        # added and then reduced once (half the bytes of two all-reduces).
+        self.reduce_axes = _fused_reduce_axes(self.experts,
+                                              self.shared_experts, mesh)
+        if self.reduce_axes:
+            self.shared_experts.down_proj.quant_method.linear_config.defer_all_reduce = True
 
     def __call__(self,
                  x: jax.Array,
@@ -164,9 +196,19 @@ class Glm5NextMoE(JaxModule):
             x,
             self.gate(x),
             e_score_correction_bias=self.gate.e_score_correction_bias[...],
-            num_valid_tokens=num_valid_tokens)
-        return (routed * self.routed_scaling_factor).astype(
+            num_valid_tokens=num_valid_tokens,
+            defer_all_reduce=bool(self.reduce_axes))
+        out = (routed * self.routed_scaling_factor).astype(
             x.dtype) + self.shared_experts(x)
+        if self.reduce_axes:
+            out = jax.shard_map(
+                lambda a: jax.lax.psum(a, self.reduce_axes),
+                mesh=self.mesh,
+                in_specs=P(),
+                out_specs=P(),
+                check_vma=False,
+            )(out)
+        return out
 
 
 class Glm5NextIndexer(JaxModule):

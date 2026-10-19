@@ -473,18 +473,23 @@ class JaxRoutedExperts(JaxModule):
         *,
         e_score_correction_bias: Optional[jax.Array] = None,
         num_valid_tokens: Optional[jax.Array] = None,
+        defer_all_reduce: bool = False,
     ) -> tuple[jax.Array, Optional[jax.Array]]:
         """`e_score_correction_bias` [E] (DeepSeek-style noaux_tc routing):
         experts are chosen by score + bias, weighted by the unbiased score.
         `num_valid_tokens` (scalar): tokens past it are padding and are routed
         to expert 0 with weight 0, so they don't activate other experts.
-        Both are supported by the GMM backends."""
+        `defer_all_reduce`: return per-shard partial sums (the caller
+        reduces them, e.g. together with a shared expert's).
+        All three are supported by the GMM backends."""
         assert self.quant_method is not None
         extra = {}
         if e_score_correction_bias is not None:
             extra["e_score_correction_bias"] = e_score_correction_bias
         if num_valid_tokens is not None:
             extra["num_valid_tokens"] = num_valid_tokens
+        if defer_all_reduce:
+            extra["defer_all_reduce"] = True
         kwargs = {}
         if extra:
             if self.moe_backend not in (MoEBackend.GMM_EP, MoEBackend.GMM_TP):
