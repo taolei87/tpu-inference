@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     MOE_GATHER_REDUCE_ON_TC: bool = False
     GMM_DECODE_TILING_MAX_ROWS: int = 1024
     MLA_WHOLE_ROW_GATHER: bool = False
+    GLM5_MOE_TOKEN_SPLITS: int = 1
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -587,6 +588,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one-hot matmul, instead of one gather per token.
     "MLA_WHOLE_ROW_GATHER":
     env_bool("MLA_WHOLE_ROW_GATHER", default=False),
+    # GLM-5.3-Flash: run a prefill-sized step's routed experts as this many
+    # token slices (overlapping one slice's SparseCore combine with the next
+    # one's GMMs); 1 runs them at once.
+    "GLM5_MOE_TOKEN_SPLITS":
+    lambda: int(os.getenv("GLM5_MOE_TOKEN_SPLITS") or "1"),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which

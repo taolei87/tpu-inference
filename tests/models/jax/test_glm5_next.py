@@ -432,3 +432,18 @@ def test_fp8_fused_expert_all_reduce(tmp_path):
     print("FUSEDREDUCE", e_fused, e_split, _rel(fused[0][0], split[0][0]))
     # bf16 rounding of the partial sums: as close to the f32 reference
     assert e_fused < 1.1 * e_split + 1e-3, (e_fused, e_split)
+
+
+def test_moe_token_splits(tiny_dir, monkeypatch):
+    """GLM5_MOE_TOKEN_SPLITS runs the routed experts as token slices: the
+    same output as one call (routing and GMM rows are per token)."""
+    from tpu_inference.models.jax import glm5_next as G
+    vllm_config, model, mesh = _build(tiny_dir)
+    text = vllm_config.model_config.hf_text_config
+    ids = {0: np.random.default_rng(3).integers(0, text.vocab_size, 30)}
+    monkeypatch.setattr(G, "MOE_SPLIT_MIN_TOKENS", 16)
+    monkeypatch.setenv("GLM5_MOE_TOKEN_SPLITS", "1")
+    one = _run(model, mesh, _Caches(text), [(0, 0, 30)], ids)
+    monkeypatch.setenv("GLM5_MOE_TOKEN_SPLITS", "2")
+    two = _run(model, mesh, _Caches(text), [(0, 0, 30)], ids)
+    np.testing.assert_allclose(two[0][0], one[0][0], rtol=1e-5, atol=1e-5)

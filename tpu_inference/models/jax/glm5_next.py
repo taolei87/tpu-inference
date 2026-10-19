@@ -37,6 +37,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from vllm.model_executor.models.utils import WeightsMapper
 
+import tpu_inference.envs as envs
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.sparse_mla_indexer import run_sparse_mla_step
@@ -53,6 +54,9 @@ from tpu_inference.runner import glm5_next_kv_cache
 from tpu_inference.utils import get_mesh_shape_product
 
 init_fn = nnx.initializers.uniform()
+
+# GLM5_MOE_TOKEN_SPLITS applies to steps of at least this many tokens
+MOE_SPLIT_MIN_TOKENS = 4096
 
 
 def swiglu_clamped(gate: jax.Array, up: jax.Array, limit: float) -> jax.Array:
@@ -192,12 +196,27 @@ class Glm5NextMoE(JaxModule):
     def __call__(self,
                  x: jax.Array,
                  num_valid_tokens: Optional[jax.Array] = None) -> jax.Array:
-        routed, _ = self.experts(
-            x,
-            self.gate(x),
-            e_score_correction_bias=self.gate.e_score_correction_bias[...],
-            num_valid_tokens=num_valid_tokens,
-            defer_all_reduce=bool(self.reduce_axes))
+        logits = self.gate(x)
+        # GLM5_MOE_TOKEN_SPLITS > 1 runs a prefill-sized step's routed experts
+        # as that many independent token slices, so one slice's SparseCore
+        # combine can overlap the next one's GMMs on the TensorCore.
+        T, n = x.shape[0], envs.GLM5_MOE_TOKEN_SPLITS
+        if n < 2 or T < MOE_SPLIT_MIN_TOKENS or T % (16 * n):
+            n = 1
+        parts = []
+        for c in range(n):
+            lo = c * (T // n)
+            nv = num_valid_tokens
+            if nv is not None and n > 1:
+                nv = jnp.clip(nv - lo, 0, T // n)
+            routed, _ = self.experts(
+                x[lo:lo + T // n],
+                logits[lo:lo + T // n],
+                e_score_correction_bias=self.gate.e_score_correction_bias[...],
+                num_valid_tokens=nv,
+                defer_all_reduce=bool(self.reduce_axes))
+            parts.append(routed)
+        routed = jnp.concatenate(parts) if n > 1 else parts[0]
         out = (routed * self.routed_scaling_factor).astype(
             x.dtype) + self.shared_experts(x)
         if self.reduce_axes:
