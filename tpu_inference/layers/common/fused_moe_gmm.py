@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 from typing import Literal
 
@@ -102,6 +103,25 @@ def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
                 f"FusedMoE does not support {scoring_fn} scoring function")
 
 
+def _decode_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+    """The default tiles with row buckets of 16 for decode-sized GMMs.
+
+    At decode most groups hold one to a few rows, but the default tiling runs
+    every group's matmul over its whole bucket (64 to 128 rows). Buckets of 16
+    (up to a 64-row tile) halve the gate/up GMM time at 4 to 8 decode tokens of
+    GLM-5.3-Flash at TP=16 (fp8 weights) and leave the down GMM unchanged; the
+    output is identical. Prefill-sized GMMs keep the default tiles."""
+    tiles = _safe_calculate_tiling(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes,
+                                   fuse_act)
+    if dims.size_m > envs.GMM_DECODE_TILING_MAX_ROWS:
+        return tiles
+    tile_m = min(tiles.tile_m, 64)
+    bucket = min(16, tile_m)
+    if tile_m % bucket or bucket % dims.size_lhs_sublane:
+        return tiles
+    return dataclasses.replace(tiles, tile_m=tile_m, bucket_base=bucket)
+
+
 def gmm_wrapper(lhs,
                 rhs,
                 rhs_scale,
@@ -117,7 +137,7 @@ def gmm_wrapper(lhs,
         rhs_bias=rhs_bias,
         group_sizes=group_sizes,
         group_offset=group_offset[0],
-        tile_info=_safe_calculate_tiling,
+        tile_info=_decode_tiling,
         zero_initialize=False,
         fuse_act=fuse_act,
         preferred_element_type=preferred_element_type,

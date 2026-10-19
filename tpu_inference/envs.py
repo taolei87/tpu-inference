@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
     MOE_GATHER_REDUCE_ON_TC: bool = False
+    GMM_DECODE_TILING_MAX_ROWS: int = 1024
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -576,6 +577,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dense_gather_reduce kernel.
     "MOE_GATHER_REDUCE_ON_TC":
     env_bool("MOE_GATHER_REDUCE_ON_TC", default=False),
+    # MoE GMMs with at most this many rows (tokens x top-k) use row buckets of
+    # 16 (fused_moe_gmm._decode_tiling); 0 keeps the default tiles everywhere.
+    "GMM_DECODE_TILING_MAX_ROWS":
+    lambda: int(os.getenv("GMM_DECODE_TILING_MAX_ROWS") or "1024"),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which
