@@ -1041,9 +1041,13 @@ def fused_moe_func(
         if expert_score_correction_bias is not None:
             _, topk_indices = jax.lax.top_k(
                 topk_weights + expert_score_correction_bias[None, :], k=topk)
-            topk_weights = jnp.take_along_axis(topk_weights,
-                                               topk_indices,
-                                               axis=-1)
+            # the chosen experts' unbiased scores, by a one-hot select (exact;
+            # take_along_axis lowers to a slow batched gather on TPU)
+            chosen = topk_indices[...,
+                                  None] == jnp.arange(topk_weights.shape[-1],
+                                                      dtype=topk_indices.dtype)
+            topk_weights = jnp.where(chosen, topk_weights[:, None, :],
+                                     0).sum(-1)
         else:
             topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
@@ -1096,12 +1100,10 @@ def fused_moe_func(
             topk_indices, global_num_experts)
 
     def _process_tokens_locally(hidden_states_local, topk_indices_local):
-        num_tokens_local = hidden_states_local.shape[0]
         topk_indices_flat = topk_indices_local.flatten()
         topk_argsort_indices = jnp.argsort(topk_indices_flat)
-        token_indices = jnp.arange(num_tokens_local,
-                                   dtype=jnp.int32).repeat(topk)
-        token_indices_sorted = token_indices[topk_argsort_indices]
+        # the token of flat entry j is j // topk (no gather needed)
+        token_indices_sorted = (topk_argsort_indices // topk).astype(jnp.int32)
         # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
         # length=global_num_experts) but is more performant.
         group_sizes_local = jax.nn.one_hot(topk_indices_flat,
