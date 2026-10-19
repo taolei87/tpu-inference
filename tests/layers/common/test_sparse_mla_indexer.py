@@ -58,9 +58,13 @@ def _inputs(seed, ties):
             jnp.asarray([1, len(step), len(step)], jnp.int32))
 
 
+@pytest.mark.parametrize("mode", ["buffered", "merge"])
 @pytest.mark.parametrize("ties", [False, True])
 @pytest.mark.parametrize("pool_chunk", [4, 8, 20])
-def test_streaming_selection_matches_one_shot(ties, pool_chunk):
+def test_streaming_selection_matches_one_shot(ties, pool_chunk, mode,
+                                              monkeypatch):
+    from tpu_inference.layers.common import sparse_mla_indexer as SM
+    monkeypatch.setattr(SM, "TOPK_MODE", mode)
     args = _inputs(0, ties)
     kw = dict(index_topk=32, scale=KVR**-0.5, kvr=KVR)  # K = 8 pools
     ref = sparse_nope_mla(*args, **kw, pool_chunk=None)

@@ -259,6 +259,27 @@ def select_pools(qi, wts, req, positions, *, pooled, bt, page_size: int,
             return top_k(sc, K)
         pages = bt_pad[req_b]  # [Tb, n_chunks * cpages]
         Tb = pages.shape[0]
+        # chunks holding at least one complete pool visible from the block
+        visible_pools = (jnp.max(pos_b) + 1) // kp
+        n = jnp.minimum(-(-visible_pools // (cpages * prows)), n_chunks)
+
+        if TOPK_MODE == "buffered":
+            # the visible chunks' scores into one buffer, then one exact
+            # approx_max_k (recall 1.0: exact, and on TPU faster than top_k);
+            # its indices are the pool ids, so nothing is merged or gathered
+            def fill(j, buf):
+                pg = lax.dynamic_slice_in_dim(pages,
+                                              j * cpages,
+                                              cpages,
+                                              axis=1)
+                sc, _ = scores(qi_b, w_b, pg, j * cpages * prows, pos_b, same)
+                return lax.dynamic_update_slice_in_dim(buf, sc,
+                                                       j * cpages * prows, 1)
+
+            buf = lax.fori_loop(
+                0, n, fill, jnp.full((Tb, n_chunks * cpages * prows), lo, f32))
+            v, i = lax.approx_max_k(buf, K, recall_target=1.0)
+            return v, i.astype(jnp.int32)
 
         def body(j, carry):
             vals, idx = carry
@@ -274,9 +295,6 @@ def select_pools(qi, wts, req, positions, *, pooled, bt, page_size: int,
             rows = jnp.arange(Tb, dtype=i.dtype)[:, None] * cv.shape[-1]
             return v, ci.reshape(-1)[rows + i]
 
-        # chunks holding at least one complete pool visible from the block
-        visible_pools = (jnp.max(pos_b) + 1) // kp
-        n = jnp.minimum(-(-visible_pools // (cpages * prows)), n_chunks)
         init = (jnp.full((Tb, K), lo, f32), jnp.zeros((Tb, K), jnp.int32))
         return lax.fori_loop(0, n, body, init)
 
@@ -300,6 +318,11 @@ def select_pools(qi, wts, req, positions, *, pooled, bt, page_size: int,
     tok = lax.map(block, blocks)
     return tok.reshape(-1, tok.shape[-1])[:T]
 
+
+# How the streaming selection takes its top K: "buffered" scores every visible
+# chunk into one buffer and takes one approx_max_k(recall_target=1.0) (exact);
+# "merge" keeps a running top K merged chunk by chunk (ties: lowest pool id).
+TOPK_MODE = "buffered"
 
 # Steps of at least this many queries view the latent cache as rows of kpool
 # tokens (on TPU the reshape copies the whole cache once per call: amortized
