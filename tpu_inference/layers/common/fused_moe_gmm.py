@@ -366,6 +366,14 @@ def moe_gmm_local(x: jax.Array,
                 chunk_hidden = ragged_gather_reduce(gmm2_res, cur_indices,
                                                     cur_weights.reshape(-1),
                                                     cur_mask.reshape(-1), topk)
+        elif envs.MOE_GATHER_REDUCE_ON_TC:
+            # whole hidden rows: a TensorCore row gather; f32 accumulation
+            # like the SparseCore kernel
+            rows = gmm2_res[topk_argsort_revert_indices].reshape(
+                -1, topk, gmm2_res.shape[-1])
+            chunk_hidden = (rows.astype(jnp.float32) *
+                            topk_weights.astype(jnp.float32)[..., None]).sum(
+                                axis=1).astype(gmm2_res.dtype)
         else:
             chunk_hidden = dense_gather_reduce(
                 gmm2_res,

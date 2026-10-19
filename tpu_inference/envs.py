@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     MOE_FOLD_ROUTING_INTO_DISPATCH: bool = False
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
+    MOE_GATHER_REDUCE_ON_TC: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -570,6 +571,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # off, the block-padded output goes straight to gmm_v2, skipping the copy.
     "RAGGED_GATHER_TRIM_ROWS":
     env_bool("RAGGED_GATHER_TRIM_ROWS", default=True),
+    # TP MoE combine (un-permute + top-k weighted sum): an XLA row gather and
+    # reduction on the TensorCore instead of the SparseCore
+    # dense_gather_reduce kernel.
+    "MOE_GATHER_REDUCE_ON_TC":
+    env_bool("MOE_GATHER_REDUCE_ON_TC", default=False),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which
