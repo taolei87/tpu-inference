@@ -387,3 +387,19 @@ def test_sparse_model_matches_reference(tmp_path):
         logits = np.concatenate([g[1] for g in got[r]])
         assert _rel(h, ref[r][0]) < 1e-4, r
         assert _rel(logits, ref[r][1]) < 1e-4, r
+
+
+def test_num_valid_tokens_for_moe_padding():
+    """The MoE routes the step's padding rows to expert 0, from the token
+    count in query_start_loc; attention DP (rank-interleaved padding) opts
+    out."""
+    from tpu_inference.models.jax.glm5_next import _num_valid_tokens
+    md = AttentionMetadata(input_positions=jnp.zeros(16, jnp.int32),
+                           query_start_loc=jnp.asarray([0, 3, 5, 5, 5]))
+    devs = np.array(jax.devices())
+    mesh = Mesh(devs[:1].reshape(1, 1, 1, 1, 1, 1, 1), MESH_AXIS_NAMES)
+    assert int(_num_valid_tokens(md, mesh)) == 5
+    assert int(_num_valid_tokens((md, md), mesh)) == 5  # MLA: (latent, tail)
+    if len(devs) >= 2:
+        dp = Mesh(devs[:2].reshape(1, 2, 1, 1, 1, 1, 1), MESH_AXIS_NAMES)
+        assert _num_valid_tokens(md, dp) is None

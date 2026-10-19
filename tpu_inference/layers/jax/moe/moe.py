@@ -472,20 +472,26 @@ class JaxRoutedExperts(JaxModule):
         router_logits: jax.Array,
         *,
         e_score_correction_bias: Optional[jax.Array] = None,
+        num_valid_tokens: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, Optional[jax.Array]]:
         """`e_score_correction_bias` [E] (DeepSeek-style noaux_tc routing):
         experts are chosen by score + bias, weighted by the unbiased score.
-        Supported by the GMM backends."""
+        `num_valid_tokens` (scalar): tokens past it are padding and are routed
+        to expert 0 with weight 0, so they don't activate other experts.
+        Both are supported by the GMM backends."""
         assert self.quant_method is not None
-        kwargs = {}
+        extra = {}
         if e_score_correction_bias is not None:
+            extra["e_score_correction_bias"] = e_score_correction_bias
+        if num_valid_tokens is not None:
+            extra["num_valid_tokens"] = num_valid_tokens
+        kwargs = {}
+        if extra:
             if self.moe_backend not in (MoEBackend.GMM_EP, MoEBackend.GMM_TP):
                 raise NotImplementedError(
-                    "e_score_correction_bias needs a GMM MoE backend, got "
+                    f"{sorted(extra)} need a GMM MoE backend, got "
                     f"{self.moe_backend}")
-            kwargs["extra_backend_kwargs"] = {
-                "e_score_correction_bias": e_score_correction_bias
-            }
+            kwargs["extra_backend_kwargs"] = extra
         x_TD = self.quant_method.apply_jax(self,
                                            x_TD,
                                            router_logits=router_logits,

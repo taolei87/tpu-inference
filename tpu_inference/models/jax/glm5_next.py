@@ -49,6 +49,7 @@ from tpu_inference.models.jax.utils.weight_utils import (
     JaxAutoWeightsLoader, LoadableWithIterator,
     load_nnx_param_from_reshaped_torch)
 from tpu_inference.runner import glm5_next_kv_cache
+from tpu_inference.utils import get_mesh_shape_product
 
 init_fn = nnx.initializers.uniform()
 
@@ -156,11 +157,14 @@ class Glm5NextMoE(JaxModule):
                                           quant_config=quant_config,
                                           prefix=f"{prefix}.shared_experts")
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(self,
+                 x: jax.Array,
+                 num_valid_tokens: Optional[jax.Array] = None) -> jax.Array:
         routed, _ = self.experts(
             x,
             self.gate(x),
-            e_score_correction_bias=self.gate.e_score_correction_bias[...])
+            e_score_correction_bias=self.gate.e_score_correction_bias[...],
+            num_valid_tokens=num_valid_tokens)
         return (routed * self.routed_scaling_factor).astype(
             x.dtype) + self.shared_experts(x)
 
@@ -453,9 +457,31 @@ class Glm5NextDecoderLayer(JaxModule):
                                                       *self._site("ffn"),
                                                       self.mhc_cfg, **kw)
         with jax.named_scope(ffn):
-            h = self.mlp(self.post_attention_layernorm(h))
+            h = self.post_attention_layernorm(h)
+            if ffn == "moe":
+                h = self.mlp(h, _num_valid_tokens(attention_metadata,
+                                                  self.mesh))
+            else:
+                h = self.mlp(h)
         with jax.named_scope("mhc"):
             return kv_cache, mhc.mhc_post(h, streams, post, comb, **kw)
+
+
+def _num_valid_tokens(attention_metadata, mesh: Mesh) -> Optional[jax.Array]:
+    """Number of real (unpadded) tokens in the step, or None under attention
+    DP, where each rank's padding is interleaved with the next rank's tokens.
+
+    The runner pads a step to a token bucket (at least 16 tokens), and the
+    padding rows would otherwise route to arbitrary experts: at batch 1 that is
+    up to 16x the expert weights a decode step has to read."""
+    if isinstance(attention_metadata, tuple):  # MLA: (latent, indexer tail)
+        attention_metadata = attention_metadata[0]
+    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
+        return None
+    qsl = attention_metadata.query_start_loc
+    # the runner repeats the end offset past the last request; max() also
+    # covers zero padding
+    return None if qsl is None else jnp.max(qsl)
 
 
 class Glm5NextModel(JaxModule):
