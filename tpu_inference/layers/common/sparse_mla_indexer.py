@@ -331,6 +331,13 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
         page = bt_flat[req_b[:, None] * pps + pl // ppp]  # [Tb, n]
         if pool_rows is not None:
             keys = pool_rows[page * ppp + pl % ppp][..., :kvr]
+        elif kp % packing == 0:
+            # a pool is kp / packing whole cache rows: gather the rows with
+            # their [packing, width] intact (indexing into the packing axis
+            # is a sub-word gather on TPU)
+            rpp = kp // packing
+            rows = ((pl % ppp) * rpp)[..., None] + jnp.arange(rpp)
+            keys = latent[page[..., None], rows][..., :kvr]
         else:
             off = (pl % ppp)[..., None] * kp + jnp.arange(kp)  # [Tb, n, kp]
             keys = latent[page[..., None], off // packing, off % packing, :kvr]
