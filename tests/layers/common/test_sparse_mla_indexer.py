@@ -169,3 +169,22 @@ def test_packed_latent_writes(packing):
         pk = write_latents(pk, *args)
         np.testing.assert_array_equal(np.asarray(pk.reshape(ref.shape)),
                                       np.asarray(ref))
+
+
+@pytest.mark.parametrize("packing", [4, 16])
+def test_fp8_latent_cache_whole_row_gathers(packing):
+    """An fp8 latent cache packed several pools per row (the TPU MLA cache
+    packs 32 tokens per row) gives the same attention as packing 1."""
+    args = list(_inputs(5, False))
+    kw = dict(index_topk=32, scale=KVR**-0.5, kvr=KVR, pool_chunk=8)
+    lat = np.asarray(args[3]).astype(
+        jnp.float8_e4m3fn)  # [pages, PAGE, 1, KVR]
+    args[3] = jnp.asarray(lat)
+    flat = sparse_nope_mla(*args, **kw)
+    args[3] = jnp.asarray(
+        lat.reshape(lat.shape[0], PAGE // packing, packing, KVR))
+    packed = sparse_nope_mla(*args, **kw)
+    np.testing.assert_allclose(np.asarray(packed),
+                               np.asarray(flat),
+                               rtol=1e-6,
+                               atol=1e-6)

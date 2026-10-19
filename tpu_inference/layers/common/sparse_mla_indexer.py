@@ -374,6 +374,21 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
         page = bt_flat[req_b[:, None] * pps + pl // ppp]  # [Tb, n]
         if pool_rows is not None:
             keys = pool_rows[page * ppp + pl % ppp][..., :kvr]
+        elif packing % kp == 0 and jnp.dtype(latent.dtype).itemsize == 1:
+            # 8-bit cache (TPU tiling (32, 128) on [packing, width]): gather the
+            # whole row holding the pool and pick its kp tokens with a one-hot
+            # matmul. Indexing into the packing axis makes XLA re-tile the
+            # whole cache to (8, 128) and back on every call.
+            ppr = packing // kp  # pools per row
+            r = (pl % ppp) // ppr
+            rows_data = latent[page, r][..., :kvr].astype(jnp.bfloat16)
+            sel = (pl % ppr)[..., None] * kp + jnp.arange(kp)  # [Tb, n, kp]
+            onehot = (sel[...,
+                          None] == jnp.arange(packing)).astype(jnp.bfloat16)
+            keys = jnp.einsum("bnkp,bnpr->bnkr",
+                              onehot,
+                              rows_data,
+                              precision=lax.Precision.HIGHEST)
         elif kp % packing == 0:
             # a pool is kp / packing whole cache rows: gather the rows with
             # their [packing, width] intact (indexing into the packing axis
@@ -401,6 +416,10 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
                           keys,
                           preferred_element_type=f32)
 
+    if (pool_rows is None and packing % kp == 0 and packing > kp
+            and jnp.dtype(latent.dtype).itemsize == 1):
+        query_block = min(query_block,
+                          8)  # whole-row gathers: packing / kp x data
     query_block = min(query_block, T)
     pad = (-T) % query_block
     args = [
