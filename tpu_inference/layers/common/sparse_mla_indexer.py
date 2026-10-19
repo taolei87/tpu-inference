@@ -276,10 +276,30 @@ def select_pools(qi, wts, req, positions, *, pooled, bt, page_size: int,
                 return lax.dynamic_update_slice_in_dim(buf, sc,
                                                        j * cpages * prows, 1)
 
-            buf = lax.fori_loop(
-                0, n, fill, jnp.full((Tb, n_chunks * cpages * prows), lo, f32))
-            v, i = lax.approx_max_k(buf, K, recall_target=1.0)
-            return v, i.astype(jnp.int32)
+            # The buffer follows the visible context: a power-of-two number of
+            # chunks (static per branch) >= n, so the top-K pass costs what the
+            # context needs rather than max_model_len.
+            c_min = -(-K // (cpages * prows))  # at least K pools
+            sizes = sorted({
+                min(max(1 << e, c_min), n_chunks)
+                for e in range(n_chunks.bit_length() + 1)
+            })
+
+            def branch(c):
+
+                def run(_):
+                    buf = lax.fori_loop(
+                        0, n, fill, jnp.full((Tb, c * cpages * prows), lo,
+                                             f32))
+                    v, i = lax.approx_max_k(buf, K, recall_target=1.0)
+                    return v, i.astype(jnp.int32)
+
+                return run
+
+            which = jnp.searchsorted(jnp.asarray(sizes), n)
+            return lax.switch(jnp.minimum(which,
+                                          len(sizes) - 1),
+                              [branch(c) for c in sizes], None)
 
         def body(j, carry):
             vals, idx = carry
