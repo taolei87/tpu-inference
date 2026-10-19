@@ -45,10 +45,12 @@ split is computed from the real per-layer bytes
 `initialize_glm5_next_kv_cache` allocates each layer with its real shapes.
 """
 import dataclasses
+import os
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from jax import dtypes
 from jax.sharding import NamedSharding, PartitionSpec
 from torchax.ops.mappings import t2j_dtype
 from vllm.utils.math_utils import cdiv
@@ -169,6 +171,19 @@ def _model_dtype(runner) -> torch.dtype:
     return dtype if isinstance(dtype, torch.dtype) else torch.bfloat16
 
 
+def _set_latent_packing(layout, kv_cache_dtype) -> None:
+    """Packs a 16-bit MLA latent cache one indexer pool (kpool tokens) per row:
+    [pages, page_size // kpool, kpool, width]. A prefill step's pool view of
+    the cache is then the cache itself, not a copy of it, and decode gathers a
+    selected pool as one row. MLA_KV_PACKING_SIZE, read when the cache's page
+    size is computed and when it's created, overrides it."""
+    if "MLA_KV_PACKING_SIZE" in os.environ:
+        return
+    if dtypes.itemsize_bits(common_utils.to_jax_dtype(kv_cache_dtype)) != 16:
+        return  # 8-bit caches keep their native (32, 128) tiling
+    os.environ["MLA_KV_PACKING_SIZE"] = str(layout.index_kpool)
+
+
 def get_glm5_next_kv_cache_spec(
         manager: "KVCacheManager") -> dict[str, KVCacheSpec]:
     """The flax_nnx path's per-layer KV cache specs for GLM-5.3-Flash."""
@@ -186,6 +201,7 @@ def get_glm5_next_kv_cache_spec(
             "speculative decoding is not supported for GLM-5.3-Flash yet")
 
     layout = Glm5NextCacheLayout.from_config(text_config, _model_dtype(runner))
+    _set_latent_packing(layout, runner.kv_cache_dtype)
     latent_page = get_attention_page_size_bytes(runner.mesh, block_size, 1,
                                                 layout.mla_head_size,
                                                 runner.kv_cache_dtype, True,

@@ -99,6 +99,17 @@ def _mesh(tp):
     return Mesh(devs, MESH_AXIS_NAMES)
 
 
+@pytest.fixture(autouse=True)
+def _latent_packing_env():
+    """The KV setup defaults MLA_KV_PACKING_SIZE (process-wide): start each
+    test without it and restore it afterwards."""
+    saved = os.environ.pop("MLA_KV_PACKING_SIZE", None)
+    yield
+    os.environ.pop("MLA_KV_PACKING_SIZE", None)
+    if saved is not None:
+        os.environ["MLA_KV_PACKING_SIZE"] = saved
+
+
 def _runner(vllm_config, mesh):
     return types.SimpleNamespace(
         vllm_config=vllm_config,
@@ -233,6 +244,9 @@ def test_vllm_planner_and_allocation(tiny_dir, tp, monkeypatch):
             assert latent.shape[-1] == lay.mla_head_size
             # (the CPU platform may override the block size for MLA)
             block_size = vllm_config.cache_config.block_size
+            # bf16 latents packed one indexer pool per row
+            assert latent.shape[1:3] == (block_size // lay.index_kpool,
+                                         lay.index_kpool)
             assert pooled.shape == (nb, block_size // lay.index_kpool,
                                     lay.index_head_dim)
             (tail, ) = runner.kv_caches[idx[G.indexer_tail_name(i)]]
