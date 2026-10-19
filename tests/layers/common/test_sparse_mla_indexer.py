@@ -138,3 +138,34 @@ def test_row_view_and_native_gathers_agree(monkeypatch):
     monkeypatch.setattr(SM, "ROW_VIEW_MIN_TOKENS", 10**9)
     native = np.asarray(SM.sparse_nope_mla(*args, **kw))
     np.testing.assert_allclose(rows, native, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("packing", [2, 4])
+def test_packed_latent_writes(packing):
+    """Whole-row writes into a packed latent cache equal per-token writes into
+    the packing-1 layout: a decode, a prefill crossing rows and a page, a short
+    request, over two steps."""
+    from tpu_inference.layers.common.nope_mla_attention import write_latents
+    rng = np.random.default_rng(0)
+    page, pps, reqs, kvr = 16, 4, 3, 8
+    num_pages = reqs * pps + 1
+    bt = jnp.asarray(rng.permutation(np.arange(1, num_pages)), jnp.int32)
+    ref = jnp.asarray(rng.standard_normal((num_pages, page, 1, kvr)),
+                      jnp.float32)
+    pk = ref.reshape(num_pages, page // packing, packing, kvr)
+    for step in ([(21, 1), (5, 13), (0, 3)], [(22, 1), (18, 6), (3, 6)]):
+        T = sum(n for _, n in step) + 5
+        pos = np.zeros(T, np.int32)
+        qsl = np.zeros(reqs + 1, np.int32)
+        t = 0
+        for i, (p0, n) in enumerate(step):
+            pos[t:t + n] = np.arange(p0, p0 + n)
+            t += n
+            qsl[i + 1] = t
+        c = jnp.asarray(rng.standard_normal((T, kvr)), jnp.float32)
+        args = (c, jnp.asarray(pos), bt, jnp.asarray(qsl),
+                jnp.asarray([1, len(step), len(step)], jnp.int32))
+        ref = write_latents(ref, *args)
+        pk = write_latents(pk, *args)
+        np.testing.assert_array_equal(np.asarray(pk.reshape(ref.shape)),
+                                      np.asarray(ref))

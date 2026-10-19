@@ -60,7 +60,24 @@ def write_latents(cache, new_c, positions, block_tables, query_start_loc,
     off = positions % page_size
     row = jnp.zeros((T, width),
                     cache.dtype).at[:, :kvr].set(new_c.astype(cache.dtype))
-    return cache.at[page, off // packing, off % packing].set(row, mode="drop")
+    if packing == 1:
+        return cache.at[page, off, 0].set(row, mode="drop")
+    # Packed rows (bf16: 2, fp8: 4 tokens): write whole rows. A scatter into
+    # the packing axis is a sub-word update on TPU. Every token assembles its
+    # destination row: the slots this step writes come from its row-mates,
+    # which are its neighbours in the packed stream (same request,
+    # consecutive positions); the other slots keep the cache's values. Tokens
+    # sharing a row write the same row.
+    r = off // packing
+    old = cache[jnp.minimum(page, num_pages - 1), r]  # [T, packing, width]
+    s = jnp.arange(packing)
+    src = jnp.arange(T)[:, None] - (off % packing)[:, None] + s  # [T, packing]
+    srcc = jnp.clip(src, 0, T - 1)
+    mine = ((src >= 0) & (src < T) & valid[srcc] & (req[srcc] == req[:, None])
+            & (positions[srcc] == positions[:, None] -
+               (off % packing)[:, None] + s))
+    new_rows = jnp.where(mine[..., None], row[srcc], old)
+    return cache.at[page, r].set(new_rows, mode="drop")
 
 
 def dense_nope_mla(q_lat,
