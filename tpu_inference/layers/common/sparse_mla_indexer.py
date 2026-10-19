@@ -44,6 +44,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as P
 
+import tpu_inference.envs as envs
 from tpu_inference.layers.common.nope_mla_attention import (_cache_dims,
                                                             _token_requests,
                                                             write_latents)
@@ -379,6 +380,8 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
     pps = bt.shape[1]
     lo = jnp.finfo(jnp.float32).min
     f32 = jnp.float32
+    whole_rows = (jnp.dtype(latent.dtype).itemsize == 1
+                  or envs.MLA_WHOLE_ROW_GATHER)
 
     def block(args):
         q_b, pool_b, req_b, pos_b = args
@@ -387,11 +390,13 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
         page = bt_flat[req_b[:, None] * pps + pl // ppp]  # [Tb, n]
         if pool_rows is not None:
             keys = pool_rows[page * ppp + pl % ppp][..., :kvr]
-        elif packing % kp == 0 and jnp.dtype(latent.dtype).itemsize == 1:
+        elif packing % kp == 0 and whole_rows:
             # 8-bit cache (TPU tiling (32, 128) on [packing, width]): gather the
             # whole row holding the pool and pick its kp tokens with a one-hot
             # matmul. Indexing into the packing axis makes XLA re-tile the
-            # whole cache to (8, 128) and back on every call.
+            # whole cache to (8, 128) and back on every call. 16-bit caches
+            # (MLA_WHOLE_ROW_GATHER) trade packing / kp x the bytes for row
+            # DMAs instead of one small DMA per token.
             ppr = packing // kp  # pools per row
             r = (pl % ppp) // ppr
             rows_data = latent[page, r][..., :kvr].astype(jnp.bfloat16)
@@ -430,7 +435,7 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
                           preferred_element_type=f32)
 
     if (pool_rows is None and packing % kp == 0 and packing > kp
-            and jnp.dtype(latent.dtype).itemsize == 1):
+            and whole_rows):
         query_block = min(query_block,
                           8)  # whole-row gathers: packing / kp x data
     query_block = min(query_block, T)

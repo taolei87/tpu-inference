@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     RAGGED_GATHER_TRIM_ROWS: bool = True
     MOE_GATHER_REDUCE_ON_TC: bool = False
     GMM_DECODE_TILING_MAX_ROWS: int = 1024
+    MLA_WHOLE_ROW_GATHER: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -581,6 +582,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 16 (fused_moe_gmm._decode_tiling); 0 keeps the default tiles everywhere.
     "GMM_DECODE_TILING_MAX_ROWS":
     lambda: int(os.getenv("GMM_DECODE_TILING_MAX_ROWS") or "1024"),
+    # Sparse MLA decode gathers whole packed latent-cache rows for 16-bit
+    # caches too (8-bit caches always do), picking the pool's tokens with a
+    # one-hot matmul, instead of one gather per token.
+    "MLA_WHOLE_ROW_GATHER":
+    env_bool("MLA_WHOLE_ROW_GATHER", default=False),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which

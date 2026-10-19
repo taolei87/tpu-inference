@@ -188,3 +188,22 @@ def test_fp8_latent_cache_whole_row_gathers(packing):
                                np.asarray(flat),
                                rtol=1e-6,
                                atol=1e-6)
+
+
+@pytest.mark.parametrize("packing", [4, 16])
+def test_bf16_latent_cache_whole_row_gathers(packing, monkeypatch):
+    """MLA_WHOLE_ROW_GATHER: a bf16 cache packed several pools per row,
+    gathered as whole rows, gives the same attention as per-token gathers."""
+    args = list(_inputs(6, False))
+    kw = dict(index_topk=32, scale=KVR**-0.5, kvr=KVR, pool_chunk=8)
+    lat = np.asarray(args[3]).astype(jnp.bfloat16)  # [pages, PAGE, 1, KVR]
+    args[3] = jnp.asarray(
+        lat.reshape(lat.shape[0], PAGE // packing, packing, KVR))
+    monkeypatch.setenv("MLA_WHOLE_ROW_GATHER", "0")
+    tokens = sparse_nope_mla(*args, **kw)
+    monkeypatch.setenv("MLA_WHOLE_ROW_GATHER", "1")
+    rows = sparse_nope_mla(*args, **kw)
+    np.testing.assert_allclose(np.asarray(rows),
+                               np.asarray(tokens),
+                               rtol=1e-6,
+                               atol=1e-6)
