@@ -26,7 +26,7 @@ g_b}_proj.weight`, `{q,k,v}_conv1d.weight`, `A_log`, `dt_bias`,
 the recurrent core is `layers/common/kda_attention.run_jax_kda_attention`.
 """
 import functools
-from typing import Tuple
+from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -52,6 +52,19 @@ def _spec_group() -> int:
     except Exception:  # no vLLM config (unit tests)
         return 1
     return 1 + (spec.num_speculative_tokens if spec is not None else 0)
+
+
+def align_block_size() -> Optional[int]:
+    """The mamba block size under prefix caching ("align" mode: the state
+    slots come from the block tables), else None."""
+    try:
+        from vllm.config import get_current_vllm_config
+        cache = get_current_vllm_config().cache_config
+    except Exception:  # no vLLM config (unit tests)
+        return None
+    if getattr(cache, "mamba_cache_mode", "none") != "align":
+        return None
+    return cache.mamba_block_size or cache.block_size
 
 
 def _param(rngs: nnx.Rngs, shape, dtype, sharding, **loader_kwargs):
@@ -94,6 +107,7 @@ class KimiDeltaAttention(JaxModule):
         # speculative decoding: each request's slot group holds the states of
         # its last num_spec + 1 positions (kda_attention.spec_slots)
         self.spec_group = _spec_group()
+        self.align_block_size = align_block_size()
         heads = ShardingAxisName.ATTN_HEAD
 
         def proj(einsum, shape, sharding, name):
@@ -169,23 +183,26 @@ class KimiDeltaAttention(JaxModule):
         beta = jax.nn.sigmoid(self.b_proj(x).astype(f32))  # [T, H]
         gate = self.g_b_proj(self.g_a_proj(x))  # [T, H, d]
         conv_state, recurrent_state = kv_cache
-        new_cache, core = run_jax_kda_attention(q,
-                                                k,
-                                                v,
-                                                g,
-                                                beta,
-                                                conv_state,
-                                                recurrent_state,
-                                                self.q_conv1d.weight[...],
-                                                self.k_conv1d.weight[...],
-                                                self.v_conv1d.weight[...],
-                                                md.mamba_state_indices,
-                                                md.query_start_loc,
-                                                md.request_distribution,
-                                                md.seq_lens,
-                                                mesh=self.mesh,
-                                                positions=md.input_positions,
-                                                spec_group=self.spec_group)
+        new_cache, core = run_jax_kda_attention(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            conv_state,
+            recurrent_state,
+            self.q_conv1d.weight[...],
+            self.k_conv1d.weight[...],
+            self.v_conv1d.weight[...],
+            md.mamba_state_indices,
+            md.query_start_loc,
+            md.request_distribution,
+            md.seq_lens,
+            mesh=self.mesh,
+            positions=md.input_positions,
+            spec_group=self.spec_group,
+            block_tables=md.block_tables,
+            align_block_size=self.align_block_size)
         # Gated RMSNorm over each head (fp32, sigmoid gate).
         o = core * jax.lax.rsqrt(
             jnp.mean(core * core, -1, keepdims=True) + self.eps)

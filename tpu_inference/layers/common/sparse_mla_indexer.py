@@ -38,6 +38,7 @@ These are the correctness implementations: queries run in blocks of
 `query_block`, each gathering its request's pooled keys.
 """
 import functools
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +46,7 @@ from jax import lax
 from jax.sharding import PartitionSpec as P
 
 import tpu_inference.envs as envs
+from tpu_inference.layers.common.kda_attention import align_state_slots
 from tpu_inference.layers.common.nope_mla_attention import (_cache_dims,
                                                             _token_requests,
                                                             write_latents)
@@ -90,8 +92,18 @@ def tail_ring(kpool: int, num_spec: int) -> int:
     return -(-(kpool + num_spec) // kpool) * kpool
 
 
-def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
-                  seq_lens, query_start_loc, distribution, tail_slots):
+def indexer_write(pooled,
+                  tail,
+                  k,
+                  gate,
+                  ape,
+                  positions,
+                  block_tables,
+                  seq_lens,
+                  query_start_loc,
+                  distribution,
+                  tail_slots,
+                  tail_read_slots=None):
     """Pools the k-pools completed by this step's tokens into `pooled` and
     keeps the raw (k | gate) of every request's latest tokens in `tail`.
 
@@ -103,6 +115,9 @@ def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
     ring == kpool without speculative decoding. With num_spec drafts, ring >=
     kpool + num_spec (`tail_ring`): a verify window's rejected drafts then
     never overwrite the earlier tokens of the pool the next step completes.
+
+    tail_read_slots [max_reqs] (prefix caching; None: tail_slots): the slots
+    the earlier tokens are read from, tail_slots then the ones written.
     """
     T, ihd = k.shape
     kp = ape.shape[0]
@@ -113,6 +128,7 @@ def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
                                              page_size)
     f32 = jnp.float32
     slot = tail_slots[req]
+    read_slot = slot if tail_read_slots is None else tail_read_slots[req]
     # The pool window of every token: positions base + i, i < kpool.
     base = (positions // kp) * kp
     wpos = base[:, None] + jnp.arange(kp)  # [T, kp]
@@ -121,7 +137,8 @@ def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
         jnp.arange(T)[:, None] - (positions[:, None] - wpos), 0, T - 1)
     kg = jnp.concatenate([k, gate], -1).astype(f32)  # [T, 2 ihd]
     ring = tail.shape[1]
-    from_tail = tail[slot[:, None], wpos % ring].astype(f32)  # [T, kp, 2 ihd]
+    from_tail = tail[read_slot[:, None],
+                     wpos % ring].astype(f32)  # [T, kp, 2 ihd]
     win = jnp.where(from_step[..., None], kg[src], from_tail)
     wk, wg = win[..., :ihd], win[..., ihd:]
     probs = jax.nn.softmax(wg + ape.astype(f32)[None], axis=1)
@@ -473,10 +490,28 @@ def attend(q_lat, *, latent, pools, req, positions, bt, kp: int, scale: float,
     return lax.map(block, blocks).reshape(-1, H, kvr)[:T]
 
 
-def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
-                        positions, block_tables, seq_lens, query_start_loc,
-                        distribution, tail_slots, *, mesh, index_topk: int,
-                        scale: float, kvr: int):
+def run_sparse_mla_step(latent,
+                        pooled,
+                        tail,
+                        q_lat,
+                        c,
+                        k,
+                        gate,
+                        ape,
+                        qi,
+                        wts,
+                        positions,
+                        block_tables,
+                        seq_lens,
+                        query_start_loc,
+                        distribution,
+                        tail_slots,
+                        *,
+                        mesh,
+                        index_topk: int,
+                        scale: float,
+                        kvr: int,
+                        align_block_size: Optional[int] = None):
     """One MLA layer's cache writes and sparse attention under the mesh.
 
     Requests are sharded on ATTN_DATA: with data-parallel attention the
@@ -485,6 +520,10 @@ def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
     shard runs the single-rank ops on its own segment. Attention heads are
     sharded on ATTN_HEAD; the latent, pooled-key and tail caches are
     replicated over the head shards, and every shard writes the same values.
+
+    Prefix caching ("align" mode): align_block_size = the mamba block size and
+    tail_slots the tail group's block tables; the tail slots then come from
+    `align_state_slots`.
 
     Returns (latent, pooled, tail, o_lat [T, H, kvr]).
     """
@@ -499,11 +538,18 @@ def run_sparse_mla_step(latent, pooled, tail, q_lat, c, k, gate, ape, qi, wts,
         # over them by query instead of repeating it
         split = n_head_shards > 1 and positions.shape[0] % n_head_shards == 0
         shard = (H, n_head_shards) if split else None
+        tail_read = None
+        if align_block_size is not None:
+            tail_read, tail_slots = align_state_slots(tail_slots,
+                                                      query_start_loc,
+                                                      seq_lens,
+                                                      align_block_size,
+                                                      tail.shape[0])
         latent = write_latents(latent, c, positions, block_tables,
                                query_start_loc, distribution)
         pooled, tail = indexer_write(pooled, tail, k, gate, ape, positions,
                                      block_tables, seq_lens, query_start_loc,
-                                     distribution, tail_slots)
+                                     distribution, tail_slots, tail_read)
         o_lat = sparse_nope_mla(q_lat,
                                 qi,
                                 wts,

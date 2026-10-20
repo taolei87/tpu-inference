@@ -297,8 +297,9 @@ def initialize_glm5_next_kv_cache(manager: "KVCacheManager",
     else:
         from tpu_inference.core.hybrid_coordinator import (
             mamba_blocks_per_request, mamba_pool_size)
-        _, stride = mamba_blocks_per_request(runner.vllm_config,
-                                             is_align_mode=False)
+        _, stride = mamba_blocks_per_request(
+            runner.vllm_config,
+            is_align_mode=runner.cache_config.mamba_cache_mode == "align")
         mamba_num_blocks = mamba_pool_size(runner.max_num_reqs, stride,
                                            divisor)
     if manager.actual_mamba_num_blocks is None:

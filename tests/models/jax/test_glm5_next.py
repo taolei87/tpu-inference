@@ -703,3 +703,94 @@ def _run_spec(model, mesh, caches, step, toks):
         out[rid] = (np.asarray(h[t:t + n]), np.asarray(logits[t:t + n]))
         t += n
     return out
+
+
+def test_prefix_caching_align_mode(tmp_path, monkeypatch):
+    """Prefix caching ("align" mode, mamba block = page = 16 tokens), in the
+    sparse regime (index_topk 16): request 0 prefills 40 tokens in
+    block-aligned chunks and decodes across a block boundary; request 1
+    shares its first 32 tokens and starts from the cache: request 0's two MLA
+    pages and its KDA / indexer-tail state block 1, with null blocks before
+    it, as vLLM's MambaManager hands them out. The KDA and tail layers find
+    their slots from their own block tables (per-layer metadata, as the
+    runner's GroupedAttentionMetadata). Every computed token matches the
+    reference."""
+    from tpu_inference.layers.jax.attention import kda as kda_layer
+    from tpu_inference.models.jax import glm5_next as glm_module
+    monkeypatch.setattr(kda_layer, "align_block_size", lambda: PAGE)
+    monkeypatch.setattr(glm_module, "align_block_size", lambda: PAGE)
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=29, index_topk=16)
+    vllm_config, model, mesh = _build(d)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(14)
+    ids = {0: rng.integers(0, text.vocab_size, 50)}
+    ids[1] = np.concatenate(
+        [ids[0][:32], rng.integers(0, text.vocab_size, 25)])
+    ref = _reference(d, ids, sparse="always")
+    caches = _Caches(text)
+    lay, n_slots = caches.lay, 16
+    state_names = {KV.layer_name(i) for i in lay.kda_layers}
+    state_names |= {KV.indexer_tail_name(i) for i in lay.mla_layers}
+    for name in state_names:  # fresh slot pools with garbage in them
+        idx = caches.index[name]
+        caches.kv_caches[idx] = tuple(
+            jnp.asarray(rng.standard_normal((n_slots, ) +
+                                            x.shape[1:]), x.dtype)
+            for x in caches.kv_caches[idx])
+    pages = caches.block_tables.reshape(MAX_REQS, PAGES_PER_SEQ).copy()
+    pages[1, :2] = pages[0, :2]
+    states = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+    states[0, :4] = [5, 9, 2, 14]
+    states[1, 1:4] = [9, 7, 11]
+
+    def run(step):
+        md, T = caches.metadata(step)
+        page_bt = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+        state_bt = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+        for i, (rid, _, _) in enumerate(step):
+            page_bt[i], state_bt[i] = pages[rid], states[rid]
+        page_md = dataclasses.replace(md,
+                                      block_tables=jnp.asarray(
+                                          page_bt.reshape(-1)),
+                                      mamba_state_indices=None)
+        state_md = dataclasses.replace(page_md,
+                                       block_tables=jnp.asarray(
+                                           state_bt.reshape(-1)))
+        mds = {
+            n: state_md if n in state_names else page_md
+            for n in caches.index
+        }
+        tokens = np.concatenate([ids[rid][p0:p0 + n] for rid, p0, n in step])
+        tokens = np.pad(tokens, (0, T - len(tokens)))
+        names = tuple(caches.index.items())
+
+        @jax.jit
+        def fwd(model, kv, tok, mds):
+            kv, h, _, _ = model(kv, tok, mds, None, None, names)
+            return kv, h, model.compute_logits(h)
+
+        with jax.set_mesh(mesh):
+            caches.kv_caches, h, logits = fwd(model, caches.kv_caches,
+                                              jnp.asarray(tokens), mds)
+        out, t = {}, 0
+        for rid, p0, n in step:
+            out[rid] = (np.asarray(h[t:t + n]), np.asarray(logits[t:t + n]))
+            t += n
+        return out
+
+    steps = [[(0, 0, 16)], [(0, 16, 16)], [(0, 32, 8), (1, 32, 16)],
+             [(0, 40, 1), (1, 48, 7)]]
+    steps += [[(0, 41 + i, 1), (1, 55 + i, 1)] for i in range(2)]
+    steps += [[(0, p, 1)] for p in range(43, 50)]
+    got = {0: ([], []), 1: ([], [])}
+    for step in steps:
+        out = run(step)
+        for rid, _, _ in step:
+            got[rid][0].append(out[rid][0])
+            got[rid][1].append(out[rid][1])
+    for rid, start in ((0, 0), (1, 32)):
+        h, logits = (np.concatenate(x) for x in got[rid])
+        assert h.shape[0] == len(ids[rid]) - start, rid
+        assert _rel(h, ref[rid][0][start:]) < 1e-4, rid
+        assert _rel(logits, ref[rid][1][start:]) < 1e-4, rid

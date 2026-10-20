@@ -415,3 +415,134 @@ def test_decode_only_batch_padded_past_max_reqs():
                num_slots=5,
                pad_tokens=6)
     _check(b, *_run_local(b))
+
+
+def _align_step(stream,
+                toks,
+                conv_state,
+                rec_state,
+                block_tables,
+                mesh,
+                block_size,
+                max_reqs=4):
+    """One prefix-caching ("align" mode) step through the sharded op: toks
+    [(request, row of its block table, first position, last position + 1)],
+    decodes first; the state slots come from the block tables."""
+    C = H * D_HEAD
+    pad = 3
+    rows = [np.arange(a, e) for _, _, a, e in toks]
+    T = sum(len(r) for r in rows)
+
+    def cat(key, shape):
+        return np.concatenate(
+            [stream[r][key][x] for (r, *_), x in zip(toks, rows)] +
+            [np.zeros((pad, ) + shape, np.float32)])
+
+    qkv, g, beta = cat("qkv", (3 * C, )), cat("g",
+                                              (H, D_HEAD)), cat("beta", (H, ))
+    T_all = T + pad
+    q, k, v = (qkv[:, j * C:(j + 1) * C].reshape(T_all, H, D_HEAD)
+               for j in range(3))
+    cq, ck, cv = (stream["w"][j * C:(j + 1) * C, 0].reshape(H, D_HEAD, KS)
+                  for j in range(3))
+    qsl = np.full(max_reqs + 1, T, np.int32)
+    qsl[:len(toks) + 1] = np.concatenate([[0],
+                                          np.cumsum([len(r) for r in rows])])
+    sl = np.zeros(max_reqs, np.int32)
+    bt = np.zeros((max_reqs, block_tables.shape[1]), np.int32)
+    for i, (_, row, a, e) in enumerate(toks):
+        sl[i], bt[i] = e, block_tables[row]
+    n_dec = sum(1 for *_, a, e in toks if e - a == 1 and a > 0)
+    dist = np.array([n_dec, len(toks), len(toks)], np.int32)
+    with mesh:
+        (conv, rec), core = jax.jit(
+            K.run_jax_kda_attention,
+            static_argnames=("mesh", "chunk_size", "align_block_size"))(
+                *map(jnp.asarray, (q, k, v, g, beta)),
+                conv_state,
+                rec_state,
+                *map(jnp.asarray, (cq, ck, cv)),
+                None,
+                *map(jnp.asarray, (qsl, dist, sl)),
+                mesh=mesh,
+                chunk_size=8,
+                block_tables=jnp.asarray(bt.reshape(-1)),
+                align_block_size=block_size)
+    out, t0 = {}, 0
+    for (r, *_), x in zip(toks, rows):
+        out[r] = np.asarray(core[t0:t0 + len(x)])
+        t0 += len(x)
+    return conv, rec, out
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_prefix_caching_align_mode(tp):
+    """Prefix caching ("align" mode, block size 8): request A prefills in
+    block-aligned chunks, then a last partial chunk, then decodes across a
+    block boundary; request B shares A's first 32 tokens and resumes from
+    A's cached block 3 (a prefix-cache hit) next to A's steps. Every output
+    equals a one-shot run, and the block of the last token of every step that
+    ends on a block boundary holds the state after exactly that many tokens."""
+    if len(jax.devices()) < tp:
+        pytest.skip(f"needs {tp} devices")
+    rng = np.random.default_rng(11)
+    C, bs = H * D_HEAD, 8
+    stream = {
+        "w": (0.5 * rng.standard_normal((3 * C, 1, KS))).astype(np.float32)
+    }
+    for r, n in ((0, 45), (1, 52)):
+        stream[r] = dict(
+            qkv=rng.standard_normal((n, 3 * C)).astype(np.float32),
+            g=(-5.0 /
+               (1 + np.exp(-rng.standard_normal((n, H, D_HEAD))))).astype(
+                   np.float32),
+            beta=(1 / (1 + np.exp(-rng.standard_normal((n, H))))).astype(
+                np.float32))
+    for key in ("qkv", "g", "beta"):  # B's prompt starts with A's 32 tokens
+        stream[1][key][:32] = stream[0][key][:32]
+    # A owns slots 3, 7, 2, 9, 4, 11; B hits A's block 3 (slot 9), then its
+    # own 12, 13, 14 (blocks before the hit are null)
+    block_tables = np.array(
+        [[3, 7, 2, 9, 4, 11, 0, 0], [0, 0, 0, 9, 12, 13, 14, 0]], np.int32)
+    steps = [[(0, 0, 0, 16)], [(0, 0, 16, 32)], [(0, 0, 32, 37),
+                                                 (1, 1, 32, 40)],
+             [(0, 0, 37, 38), (1, 1, 40, 50)]]
+    steps += [[(0, 0, p, p + 1), (1, 1, 50 + i, 51 + i)]
+              for i, p in enumerate(range(38, 40))]
+    steps += [[(0, 0, p, p + 1)] for p in range(40, 45)]
+    devs = np.array(jax.devices()[:tp]).reshape(1, 1, 1, 1, tp, 1, 1)
+    mesh = Mesh(devs, MESH_AXIS_NAMES)
+    conv = jnp.asarray(rng.standard_normal((16, KS - 1, 3 * C)), jnp.float32)
+    rec = jnp.asarray(rng.standard_normal((16, H, D_HEAD, D_HEAD)),
+                      jnp.float32)
+    acc = {0: [], 1: []}
+    after = {}  # (request, tokens) -> (conv, rec) of the block that holds it
+    for step in steps:
+        conv, rec, out = _align_step(stream, step, conv, rec, block_tables,
+                                     mesh, bs)
+        for r, row, a, e in step:
+            acc[r].append(out[r])
+            if e % bs == 0 or e in (45, 52):
+                slot = block_tables[row][(e - 1) // bs]
+                after[r, e] = (np.asarray(conv[slot]), np.asarray(rec[slot]))
+
+    def reference(r, n):
+        b = _batch(np.random.default_rng(0), [n], [False], 2, 3, 0)
+        b.update(qkv=stream[r]["qkv"][:n],
+                 g=stream[r]["g"][:n],
+                 beta=stream[r]["beta"][:n],
+                 conv_w=stream["w"])
+        return _reference(b)
+
+    for r, n in ((0, 45), (1, 52)):
+        out = np.concatenate(acc[r])
+        start = 0 if r == 0 else 32
+        assert _rel(out, reference(r, n)[0][start:]) < 1e-4, r
+    assert {k
+            for k in after} == {(0, 16), (0, 32), (0, 40), (0, 45), (1, 40),
+                                (1, 52)}
+    for (r, n), (c, s) in after.items():
+        _, ref_conv, ref_rec = reference(r, n)
+        assert _rel(s, ref_rec[0]) < 1e-4, (r, n)
+        if tp == 1:  # (the conv state's channels are per-shard for tp > 1)
+            assert _rel(c, ref_conv[0]) < 1e-5, (r, n)

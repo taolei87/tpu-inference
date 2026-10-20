@@ -44,7 +44,8 @@ from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.sparse_mla_indexer import run_sparse_mla_step
 from tpu_inference.layers.jax import JaxModule, mhc
-from tpu_inference.layers.jax.attention.kda import KimiDeltaAttention
+from tpu_inference.layers.jax.attention.kda import (KimiDeltaAttention,
+                                                    align_block_size)
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
@@ -325,6 +326,7 @@ class Glm5NextMLA(JaxModule):
         assert config.qk_rope_head_dim == 0
         self.num_heads, self.qk, self.dv, self.kvr = H, qk, dv, kvr
         self.scale = qk**-0.5
+        self.align_block_size = align_block_size()
         self.mesh = mesh
         heads = ShardingAxisName.ATTN_HEAD
 
@@ -419,11 +421,13 @@ class Glm5NextMLA(JaxModule):
             md.seq_lens,
             md.query_start_loc,
             md.request_distribution,
-            tail_md.mamba_state_indices,
+            (tail_md.mamba_state_indices
+             if self.align_block_size is None else tail_md.block_tables),
             mesh=self.mesh,
             index_topk=self.index_topk,
             scale=self.scale,
-            kvr=self.kvr)
+            kvr=self.kvr,
+            align_block_size=self.align_block_size)
         return ((latent, pooled), (tail, )), self.output(o_lat)
 
 
