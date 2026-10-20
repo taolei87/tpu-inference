@@ -44,6 +44,16 @@ from tpu_inference.models.jax.utils.weight_utils import \
 init_fn = nnx.initializers.uniform()
 
 
+def _spec_group() -> int:
+    """num_speculative_tokens + 1 under speculative decoding, else 1."""
+    try:
+        from vllm.config import get_current_vllm_config
+        spec = get_current_vllm_config().speculative_config
+    except Exception:  # no vLLM config (unit tests)
+        return 1
+    return 1 + (spec.num_speculative_tokens if spec is not None else 0)
+
+
 def _param(rngs: nnx.Rngs, shape, dtype, sharding, **loader_kwargs):
     kwargs = {}
     if loader_kwargs:
@@ -81,6 +91,9 @@ class KimiDeltaAttention(JaxModule):
         self.gate_lower_bound = config.linear_lower_bound
         self.eps = config.rms_norm_eps
         self.mesh = mesh
+        # speculative decoding: each request's slot group holds the states of
+        # its last num_spec + 1 positions (kda_attention.spec_slots)
+        self.spec_group = _spec_group()
         heads = ShardingAxisName.ATTN_HEAD
 
         def proj(einsum, shape, sharding, name):
@@ -170,7 +183,9 @@ class KimiDeltaAttention(JaxModule):
                                                 md.query_start_loc,
                                                 md.request_distribution,
                                                 md.seq_lens,
-                                                mesh=self.mesh)
+                                                mesh=self.mesh,
+                                                positions=md.input_positions,
+                                                spec_group=self.spec_group)
         # Gated RMSNorm over each head (fp32, sigmoid gate).
         o = core * jax.lax.rsqrt(
             jnp.mean(core * core, -1, keepdims=True) + self.eps)

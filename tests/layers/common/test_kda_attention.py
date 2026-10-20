@@ -17,6 +17,8 @@ import os
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
+import functools
+
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
@@ -284,3 +286,111 @@ def test_decay_mix_matches_float64(sub, scale):
                    jnp.asarray(gc, jnp.float32), sub))
     assert np.isfinite(out).all()
     np.testing.assert_allclose(out, ref, rtol=2e-4, atol=2e-4)
+
+
+def _spec_step(stream,
+               toks,
+               conv_state,
+               rec_state,
+               slots,
+               group,
+               max_reqs=4,
+               chunk_size=8):
+    """One spec-decode scheduler step: toks [(request, first position, [token
+    row indices into stream])]; positions come from first position."""
+    T = sum(len(t) for _, _, t in toks)
+    pad = 3
+    qkv = np.concatenate([stream[r]["qkv"][t] for r, _, t in toks] +
+                         [np.zeros((pad, stream[0]["qkv"].shape[1]))])
+    g = np.concatenate([stream[r]["g"][t]
+                        for r, _, t in toks] + [np.zeros((pad, H, D_HEAD))])
+    beta = np.concatenate([stream[r]["beta"][t]
+                           for r, _, t in toks] + [np.zeros((pad, H))])
+    pos = np.concatenate([p0 + np.arange(len(t)) for _, p0, t in toks] +
+                         [np.zeros(pad, int)]).astype(np.int32)
+    qsl = np.full(max_reqs + 1, T, np.int32)
+    qsl[:len(toks) + 1] = np.concatenate([[0],
+                                          np.cumsum([len(t)
+                                                     for *_, t in toks])])
+    sl = np.zeros(max_reqs, np.int32)
+    st = np.zeros(max_reqs, np.int32)
+    for i, (r, p0, t) in enumerate(toks):
+        sl[i] = p0 + len(t)
+        st[i] = slots[r]
+    n_dec = sum(1 for _, p0, t in toks if len(t) == 1 and p0 > 0)
+    dist = np.array([n_dec, len(toks), len(toks)], np.int32)
+    f = functools.partial(K.kda_conv_and_core,
+                          num_heads=H,
+                          head_dim=D_HEAD,
+                          kernel_size=KS,
+                          chunk_size=chunk_size,
+                          spec_group=group)
+    (conv, rec), core = jax.jit(f)(jnp.asarray(qkv, jnp.float32),
+                                   jnp.asarray(g, jnp.float32),
+                                   jnp.asarray(beta, jnp.float32),
+                                   conv_state,
+                                   rec_state,
+                                   jnp.asarray(stream["w"]),
+                                   jnp.asarray(qsl),
+                                   jnp.asarray(st),
+                                   jnp.asarray(dist),
+                                   jnp.asarray(sl),
+                                   positions=jnp.asarray(pos))
+    out, t0 = {}, 0
+    for r, p0, t in toks:
+        out[r] = np.asarray(core[t0:t0 + len(t)])
+        t0 += len(t)
+    return conv, rec, out
+
+
+def test_spec_decode_slot_groups_match_accepted_stream():
+    """Speculative decoding with slot groups of 4 (3 drafts): a prefill, a
+    verify window whose last two drafts are rejected (garbage inputs) next
+    to a 1-token decode, a decode-only step, then full windows. Each
+    request's accepted outputs and its state equal one plain run over the
+    accepted tokens only; rejected drafts leave no trace."""
+    rng = np.random.default_rng(9)
+    group, n = 4, 24
+    C = H * D_HEAD
+    stream = {
+        "w": (0.5 * rng.standard_normal((3 * C, 1, KS))).astype(np.float32)
+    }
+    for r in range(2):
+        stream[r] = dict(
+            qkv=rng.standard_normal((n + 8, 3 * C)).astype(np.float32),
+            g=(-5.0 /
+               (1 + np.exp(-rng.standard_normal((n + 8, H, D_HEAD))))).astype(
+                   np.float32),
+            beta=(1 / (1 + np.exp(-rng.standard_normal((n + 8, H))))).astype(
+                np.float32))
+    junk = list(range(n, n + 8))  # rows that stand for rejected drafts
+    slots = {0: 1, 1: 6}  # group bases: slots 1-4 and 6-9
+    conv = jnp.asarray(rng.standard_normal((12, KS - 1, 3 * C)), jnp.float32)
+    rec = jnp.asarray(rng.standard_normal((12, H, D_HEAD, D_HEAD)),
+                      jnp.float32)
+    acc = {0: [], 1: []}
+    steps = [
+        [(0, 0, list(range(10))), (1, 0, list(range(7)))],
+        # r0: window x10, x11 + 2 rejected drafts; r1: one token
+        [(0, 10, [10, 11, junk[0], junk[1]]), (1, 7, [7])],
+        [(0, 12, [12]), (1, 8, [8])],  # decode-only
+        [(0, 13, [13, 14, 15, 16]), (1, 9, [9, 10, junk[2], junk[3]])],
+        [(0, 17, [17, 18, 19]), (1, 11, list(range(11, 20)))],
+    ]
+    keep = [None, {0: 2, 1: 1}, None, {0: 4, 1: 2}, None]
+    for step, k in zip(steps, keep):
+        conv, rec, out = _spec_step(stream, step, conv, rec, slots, group)
+        for r, p0, t in step:
+            m = len(t) if k is None else k[r]
+            acc[r].append(out[r][:m])
+    for r, total in ((0, 20), (1, 20)):
+        b = _batch(np.random.default_rng(0), [total], [False], 2, 3, 0)
+        b.update(qkv=stream[r]["qkv"][:total],
+                 g=stream[r]["g"][:total],
+                 beta=stream[r]["beta"][:total],
+                 conv_w=stream["w"])
+        ref_out, ref_conv, ref_rec = _reference(b)
+        assert _rel(np.concatenate(acc[r]), ref_out) < 1e-4, r
+        last = slots[r] + (total - 1) % group
+        assert _rel(np.asarray(rec[last]), ref_rec[0]) < 1e-4, r
+        assert _rel(np.asarray(conv[last]), ref_conv[0]) < 1e-5, r

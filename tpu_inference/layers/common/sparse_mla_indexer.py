@@ -84,15 +84,25 @@ def _step_info(positions, block_tables, seq_lens, query_start_loc,
     return req, valid, step_start, pages_per_seq
 
 
+def tail_ring(kpool: int, num_spec: int) -> int:
+    """Indexer tail entries per request: kpool + num_spec rounded up to a
+    multiple of kpool (kpool without speculative decoding)."""
+    return -(-(kpool + num_spec) // kpool) * kpool
+
+
 def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
                   seq_lens, query_start_loc, distribution, tail_slots):
     """Pools the k-pools completed by this step's tokens into `pooled` and
-    keeps the raw (k | gate) of every request's incomplete last pool in
-    `tail`.
+    keeps the raw (k | gate) of every request's latest tokens in `tail`.
 
-    k, gate [T, ihd]; ape [kpool, ihd]; tail_slots [max_reqs] (the compact
-    slot of each request). A pool may span earlier steps (read from the
-    tail) and this step.
+    k, gate [T, ihd]; ape [kpool, ihd]; tail [slots, ring, 2 ihd], a ring
+    over positions (entry pos % ring) holding each request's last `ring`
+    positions; tail_slots [max_reqs] (the compact slot of each request). A
+    pool may span earlier steps (read from the tail) and this step.
+
+    ring == kpool without speculative decoding. With num_spec drafts, ring >=
+    kpool + num_spec (`tail_ring`): a verify window's rejected drafts then
+    never overwrite the earlier tokens of the pool the next step completes.
     """
     T, ihd = k.shape
     kp = ape.shape[0]
@@ -110,8 +120,9 @@ def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
     src = jnp.clip(
         jnp.arange(T)[:, None] - (positions[:, None] - wpos), 0, T - 1)
     kg = jnp.concatenate([k, gate], -1).astype(f32)  # [T, 2 ihd]
-    win = jnp.where(from_step[..., None], kg[src],
-                    tail[slot].astype(f32))  # [T, kp, 2 ihd]
+    ring = tail.shape[1]
+    from_tail = tail[slot[:, None], wpos % ring].astype(f32)  # [T, kp, 2 ihd]
+    win = jnp.where(from_step[..., None], kg[src], from_tail)
     wk, wg = win[..., :ihd], win[..., ihd:]
     probs = jax.nn.softmax(wg + ape.astype(f32)[None], axis=1)
     pool = (probs * wk).sum(1)  # [T, ihd]
@@ -120,12 +131,12 @@ def indexer_write(pooled, tail, k, gate, ape, positions, block_tables,
     page = jnp.where(completes, page, num_pages)  # dropped
     row = (base % page_size) // kp
     pooled = pooled.at[page, row].set(pool.astype(pooled.dtype), mode="drop")
-    # Tokens of the request's final incomplete pool go to its tail.
+    # The request's last `ring` positions go to its tail (entry pos % ring).
     end = seq_lens[req]
-    in_tail = valid & (positions >= end - end % kp)
+    in_tail = valid & (positions >= end - ring)
     tail_slot = jnp.where(in_tail, slot, tail.shape[0])
-    tail = tail.at[tail_slot, positions % kp].set(kg.astype(tail.dtype),
-                                                  mode="drop")
+    tail = tail.at[tail_slot, positions % ring].set(kg.astype(tail.dtype),
+                                                    mode="drop")
     return pooled, tail
 
 

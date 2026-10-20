@@ -565,3 +565,60 @@ def test_vision_bucketed_encode_matches_exact(tiny_dir):
                                    exact,
                                    rtol=1e-5,
                                    atol=1e-5)
+
+
+def _mtp_caches(text, caches: "_Caches", dtype=jnp.float32):
+    """The MTP layer's caches next to a _Caches (same pages and slots): its
+    latent + pooled keys and its indexer tail, under the decoder naming at
+    index num_hidden_layers."""
+    lay, i = caches.lay, text.num_hidden_layers
+    kvr = -(-text.kv_lora_rank // 128) * 128
+    kv = list(caches.kv_caches)
+    index = dict(caches.index)
+    index[KV.layer_name(i)] = len(kv)
+    kv.append((jnp.zeros((caches.num_pages, PAGE, 1, kvr), dtype),
+               jnp.zeros(lay.pooled_shape(caches.num_pages, PAGE), dtype)))
+    index[KV.indexer_tail_name(i)] = len(kv)
+    kv.append((jnp.zeros((MAX_REQS + 2, *lay.tail_shape), dtype), ))
+    return kv, index
+
+
+def test_mtp_layer_matches_reference(tiny_dir):
+    """The MTP draft model's layer over a prefill step, on the reference
+    target's hidden states: the reference mtp_layer's output (embeddings of
+    the next tokens, zeroed at position 0 as vLLM does)."""
+    from tpu_inference.models.jax.glm5_next_mtp import Glm5NextMTPModel
+    vllm_config, _, mesh = _build(tiny_dir)
+    text = vllm_config.model_config.hf_text_config
+    from transformers import Glm5NextConfig
+    rtext = Glm5NextConfig.from_pretrained(tiny_dir).text_config
+    params = jax.tree.map(jnp.asarray,
+                          RC.load_ref_params(tiny_dir, rtext, with_mtp=True))
+    rcfg = R.Cfg.from_hf(rtext)
+    with set_current_vllm_config(vllm_config), jax.set_mesh(mesh):
+        mtp = Glm5NextMTPModel(vllm_config, jax.random.key(1), mesh)
+        r = RC.CheckpointReader(tiny_dir)
+        mtp.load_weights(iter((n, r.raw(n)) for n in r.names()))
+    rng = np.random.default_rng(6)
+    ids = rng.integers(0, text.vocab_size, 21)
+    h_ref, _ = R.forward(params, jnp.asarray(ids[None]), rcfg)
+    nxt = np.roll(ids, -1)[:-1]  # the draft input at position t is token t+1
+    emb = params["embed"][jnp.asarray(nxt[None])]
+    emb = emb.at[:, 0].set(0)
+    ref, _ = R.mtp_layer(params["mtp"][0], emb, h_ref[:, :-1], rcfg)
+
+    caches = _Caches(text)
+    kv, index = _mtp_caches(text, caches)
+    md, T = caches.metadata([(0, 0, len(nxt))])
+    tok = jnp.asarray(np.pad(nxt, (0, T - len(nxt))).astype(np.int32))
+    hid = jnp.pad(h_ref[0, :-1], ((0, T - len(nxt)), (0, 0)))
+    names = tuple(index.items())
+
+    @jax.jit
+    def fwd(mtp, kv, tok, hid, md):
+        _, h, _, _ = mtp(kv, tok, hid, md, names)
+        return h
+
+    with jax.set_mesh(mesh):
+        h = np.asarray(fwd(mtp, kv, tok, hid, md))[:len(nxt)]
+    assert _rel(h, ref[0]) < 1e-4

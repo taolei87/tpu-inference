@@ -207,3 +207,52 @@ def test_bf16_latent_cache_whole_row_gathers(packing, monkeypatch):
                                np.asarray(tokens),
                                rtol=1e-6,
                                atol=1e-6)
+
+
+def test_indexer_tail_ring_survives_rejected_drafts():
+    """Speculative decoding with 3 drafts (tail ring 8, kpool 4): a verify
+    window whose drafts complete a pool and start the next one and are then
+    rejected must not corrupt the tokens the redo pools. The pooled keys after
+    prefill / rejected window / redo equal one pass over the accepted
+    tokens."""
+    from tpu_inference.layers.common.sparse_mla_indexer import (indexer_write,
+                                                                tail_ring)
+    rng = np.random.default_rng(3)
+    kp, ihd, page, pages = 4, 8, 16, 4
+    ring = tail_ring(kp, 3)
+    assert ring == 8
+    n = 20
+    k_all = rng.standard_normal((n + 8, ihd)).astype(np.float32)
+    g_all = rng.standard_normal((n + 8, ihd)).astype(np.float32)
+    ape = jnp.asarray(rng.standard_normal((kp, ihd)), jnp.float32)
+    junk = list(range(n, n + 8))
+    bt = jnp.asarray(np.arange(1, pages + 1, dtype=np.int32))  # one request
+
+    def step(pooled, tail, rows, p0):
+        T = len(rows)
+        pos = jnp.asarray(p0 + np.arange(T), jnp.int32)
+        return indexer_write(pooled, tail, jnp.asarray(k_all[rows]),
+                             jnp.asarray(g_all[rows]), ape, pos, bt,
+                             jnp.asarray([p0 + T], jnp.int32),
+                             jnp.asarray([0, T], jnp.int32),
+                             jnp.asarray([0, 1, 1], jnp.int32),
+                             jnp.asarray([1], jnp.int32))
+
+    def zeros(r):
+        return (jnp.zeros(
+            (pages + 1, page // kp, ihd)), jnp.zeros((3, r, 2 * ihd)))
+
+    # spec: prefill 0..9; window 10 + drafts at 11, 12, 13, all rejected
+    # (they complete pool 8..11 and start pool 12..15, overwriting 8 and 9 in
+    # a kpool-sized tail); the redo from 11 needs 8, 9 and 10 from the tail
+    pooled, tail = zeros(ring)
+    pooled, tail = step(pooled, tail, list(range(10)), 0)
+    pooled, tail = step(pooled, tail, [10, junk[0], junk[1], junk[2]], 10)
+    pooled, tail = step(pooled, tail, [11], 11)  # 1 accepted: resume at 11
+    pooled, tail = step(pooled, tail, list(range(12, n)), 12)
+    ref_pooled, ref_tail = zeros(kp)
+    ref_pooled, _ = step(ref_pooled, ref_tail, list(range(n)), 0)
+    np.testing.assert_allclose(np.asarray(pooled),
+                               np.asarray(ref_pooled),
+                               rtol=1e-6,
+                               atol=1e-6)

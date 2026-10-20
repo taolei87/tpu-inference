@@ -59,6 +59,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MambaSpec
 
 from tpu_inference import utils as common_utils
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sparse_mla_indexer import tail_ring
 from tpu_inference.logger import init_logger
 from tpu_inference.runner.kv_cache import (create_kv_caches,
                                            create_mamba_cache,
@@ -96,7 +97,7 @@ class Glm5NextCacheLayout:
     mla_layers: tuple[int, ...]
     conv_shape: tuple[int, int]  # (K - 1, 3 * H * d)
     state_shape: tuple[int, int, int]  # (H, d, d)
-    tail_shape: tuple[int, int]  # (kpool, 2 * index_head_dim)
+    tail_shape: tuple[int, int]  # (tail ring, 2 * index_head_dim)
     conv_dtype: torch.dtype
     state_dtype: torch.dtype
     tail_dtype: torch.dtype
@@ -105,11 +106,11 @@ class Glm5NextCacheLayout:
     index_head_dim: int
 
     @classmethod
-    def from_config(
-            cls,
-            text_config,
-            model_dtype: torch.dtype,
-            ssm_dtype: torch.dtype = torch.float32) -> "Glm5NextCacheLayout":
+    def from_config(cls,
+                    text_config,
+                    model_dtype: torch.dtype,
+                    ssm_dtype: torch.dtype = torch.float32,
+                    num_spec: int = 0) -> "Glm5NextCacheLayout":
         # transformers canonicalizes the MLA layer type to "indexed_attention"
         # (raw config.json says "deepseek_sparse_attention"): only test for
         # the linear-attention string.
@@ -124,7 +125,7 @@ class Glm5NextCacheLayout:
                    mla_layers=mla,
                    conv_shape=(K - 1, 3 * H * d),
                    state_shape=(H, d, d),
-                   tail_shape=(kp, 2 * ihd),
+                   tail_shape=(tail_ring(kp, num_spec), 2 * ihd),
                    conv_dtype=model_dtype,
                    state_dtype=ssm_dtype,
                    tail_dtype=model_dtype,
@@ -200,7 +201,9 @@ def get_glm5_next_kv_cache_spec(
         raise NotImplementedError(
             "speculative decoding is not supported for GLM-5.3-Flash yet")
 
-    layout = Glm5NextCacheLayout.from_config(text_config, _model_dtype(runner))
+    layout = Glm5NextCacheLayout.from_config(text_config,
+                                             _model_dtype(runner),
+                                             num_spec=num_spec)
     _set_latent_packing(layout, runner.kv_cache_dtype)
     latent_page = get_attention_page_size_bytes(runner.mesh, block_size, 1,
                                                 layout.mla_head_size,
