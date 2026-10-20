@@ -50,7 +50,8 @@ from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
 from tpu_inference.layers.jax.norm import JaxLayerNorm, JaxRmsNorm
 from tpu_inference.logger import init_logger
-from tpu_inference.models.jax.glm5_next_vision import Glm5NextVisionModel
+from tpu_inference.models.jax.glm5_next_vision import (Glm5NextVisionModel,
+                                                       bucket_inputs)
 from tpu_inference.models.jax.utils.multi_modal_utils import \
     merge_multimodal_embeddings
 from tpu_inference.models.jax.utils.weight_utils import (
@@ -720,11 +721,26 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
                 self.image_token_id)
         return embeds
 
-    @functools.partial(jax.jit, static_argnames=("grid", ))
+    @jax.jit
+    def encode_patches(self, patches: jax.Array, positions: jax.Array,
+                       segments: jax.Array) -> jax.Array:
+        """Patches of one image or video, padded to a bucket (see
+        glm5_next_vision.bucket_inputs) -> [bucket / 4, hidden]; one compile
+        per bucket size."""
+        return self.model.visual.encode(patches, positions, segments)
+
     def encode_grid(self, patches: jax.Array, grid: tuple) -> jax.Array:
-        """One image or video: patches [t * h * w, 1176] -> its embeddings
-        [t * h * w / 4, hidden] (one compile per grid)."""
-        return self.model.visual(patches, grid)
+        """patches [t * h * w, 1176] -> [t * h * w / 4, hidden]."""
+        n, padded, pos, seg = bucket_inputs(
+            grid, self.vision_config.spatial_merge_size)
+        patches = jnp.pad(patches, ((0, padded - n), (0, 0)))
+        if self.mesh is not None:
+            put = functools.partial(jax.device_put,
+                                    device=jax.sharding.NamedSharding(
+                                        self.mesh, P()))
+            patches, pos, seg = put(patches), put(pos), put(seg)
+        out = self.encode_patches(patches, jnp.asarray(pos), jnp.asarray(seg))
+        return out[:n // self.vision_config.spatial_merge_size**2]
 
     def embed_multimodal(self, **kwargs) -> Tuple[jax.Array, ...]:
         """One embedding array per image / video item, in the kwargs' order
@@ -739,9 +755,6 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
             if pixels is None:
                 continue
             pixels, grids = _as_patches(pixels), _as_grids(grids)
-            if self.mesh is not None:  # host -> replicated over the mesh
-                pixels = jax.device_put(
-                    pixels, jax.sharding.NamedSharding(self.mesh, P()))
             start = 0
             for grid in grids:
                 n = int(np.prod(grid))
@@ -751,9 +764,9 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
         return tuple(out)
 
     def precompile_vision_encoder(self, run_compilation_fn) -> None:
-        """Compiles the encoder for the image sizes in
+        """Compiles the encoder for the patch buckets of the image sizes in
         `additional_config["vision_warmup_config"]["image_shapes"]` ([[H, W]]
-        in pixels, multiples of 28); other sizes compile on first use."""
+        in pixels, multiples of 28); other buckets compile on first use."""
         if not self.has_vision:
             return
         extra = getattr(self.vllm_config, "additional_config", None) or {}
@@ -761,17 +774,24 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
         vc = self.vision_config
         unit = vc.patch_size * vc.spatial_merge_size
         width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+        done = set()
         for hw in shapes:
             if (len(hw) != 2 or hw[0] % unit or hw[1] % unit):
                 logger.warning("skipping vision warm-up shape %s", hw)
                 continue
             grid = (1, hw[0] // vc.patch_size, hw[1] // vc.patch_size)
-            patches = jnp.zeros((int(np.prod(grid)), width),
+            _, padded, pos, seg = bucket_inputs(grid, vc.spatial_merge_size)
+            if padded in done:
+                continue
+            done.add(padded)
+            patches = jnp.zeros((padded, width),
                                 self.vllm_config.model_config.dtype)
             run_compilation_fn("vision_encoder",
-                               functools.partial(self.encode_grid, grid=grid),
+                               self.encode_patches,
                                patches,
-                               image_shape=hw)
+                               jnp.asarray(pos),
+                               jnp.asarray(seg),
+                               num_patches=padded)
 
 
 def _vision_enabled(model_config) -> bool:

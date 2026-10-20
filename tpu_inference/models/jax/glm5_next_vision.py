@@ -80,15 +80,31 @@ def position_ids(grid: Grid, merge: int) -> np.ndarray:
     return np.tile(np.stack([hh, ww], -1), (t, 1)).astype(np.int32)
 
 
-def rotary(grid: Grid, merge: int, head_dim: int, theta: float = 10000.0):
-    """cos, sin [N, head_dim]: 2-D rotary, head_dim // 4 frequencies per axis,
-    (row freqs, col freqs) repeated twice (rotate-half layout)."""
+def rotary(pos: jax.Array, head_dim: int, theta: float = 10000.0):
+    """cos, sin [N, head_dim] for (row, col) positions [N, 2]: 2-D rotary,
+    head_dim // 4 frequencies per axis, (row freqs, col freqs) repeated twice
+    (rotate-half layout)."""
     d = head_dim // 2
     inv = 1.0 / (theta**(np.arange(0, d, 2, dtype=np.float32) / d))
-    pos = position_ids(grid, merge).astype(np.float32)
-    f = (pos[:, :, None] * inv[None, None, :]).reshape(pos.shape[0], -1)
-    emb = np.concatenate([f, f], -1)
-    return np.cos(emb), np.sin(emb)
+    f = (pos.astype(jnp.float32)[:, :, None] * inv[None, None, :]).reshape(
+        pos.shape[0], -1)
+    emb = jnp.concatenate([f, f], -1)
+    return jnp.cos(emb), jnp.sin(emb)
+
+
+def bucket_inputs(grid: Grid, merge: int, min_bucket: int = 256):
+    """(n, padded n, positions [padded, 2], frame segments [padded]) for one
+    grid: the patch count padded to a power of two (at least min_bucket), so
+    the encoder compiles once per bucket rather than per image size. Padding
+    rows are segment -1: they attend only to each other and are sliced off."""
+    t, h, w = grid
+    n = t * h * w
+    padded = max(min_bucket, 1 << (n - 1).bit_length())
+    pos = np.zeros((padded, 2), np.int32)
+    pos[:n] = position_ids(grid, merge)
+    seg = np.full(padded, -1, np.int32)
+    seg[:n] = np.repeat(np.arange(t, dtype=np.int32), h * w)
+    return n, padded, pos, seg
 
 
 def _rotate_half(x):
@@ -222,9 +238,9 @@ class Glm5NextVisionModel(JaxModule):
         return t * h * w // self.merge**2
 
     def _attend_fn(self, n: int):
-        """Attention over [n, H, d] with per-frame segments. On TPU the flash
-        attention kernel (heads over the model axis, memory linear in n);
-        elsewhere the reference masked softmax."""
+        """Attention over [n, H, d] with per-frame segments (-1: padding). On
+        TPU the flash attention kernel (heads over the model axis, memory
+        linear in n); elsewhere the reference masked softmax."""
         if jax.devices()[0].platform != "tpu":
             return _masked_attention
         from tpu_inference.kernels.flash_attention.kernel import SegmentIds
@@ -246,15 +262,15 @@ class Glm5NextVisionModel(JaxModule):
 
         return attend
 
-    def __call__(self, patches: jax.Array, grid: Grid) -> jax.Array:
-        """patches [t * h * w, 1176] -> [num_tokens(grid), out_hidden]."""
+    def encode(self, patches: jax.Array, positions: jax.Array,
+               segments: jax.Array) -> jax.Array:
+        """patches [N, 1176], (row, col) positions [N, 2] and frame segments
+        [N] (block-major order; N a multiple of 4) -> [N / 4, out_hidden].
+        Every shape is data, so one compile serves every grid of N patches."""
         cfg, dt = self.cfg, self.dtype
-        t, h, w = grid
-        n = t * h * w
+        n = patches.shape[0]
         hd = cfg.hidden_size // cfg.num_heads
-        cos, sin = (jnp.asarray(a) for a in rotary(grid, self.merge, hd))
-        # attention stays within each frame (t of them)
-        segments = jnp.asarray(np.repeat(np.arange(t, dtype=np.int32), h * w))
+        cos, sin = rotary(positions, hd)
         attend = self._attend_fn(n)
         pw = self.patch_embed.proj.weight[...]
         x = _dense(patches.astype(dt),
@@ -277,3 +293,10 @@ class Glm5NextVisionModel(JaxModule):
             jnp.float32) + ln.bias[...].astype(jnp.float32)
         y = jax.nn.gelu(y, approximate=False).astype(dt)
         return self.merger(y).astype(dt)
+
+    def __call__(self, patches: jax.Array, grid: Grid) -> jax.Array:
+        """patches [t * h * w, 1176] -> [num_tokens(grid), out_hidden]."""
+        t, h, w = grid
+        pos = position_ids(grid, self.merge)
+        seg = np.repeat(np.arange(t, dtype=np.int32), h * w)
+        return self.encode(patches, jnp.asarray(pos), jnp.asarray(seg))

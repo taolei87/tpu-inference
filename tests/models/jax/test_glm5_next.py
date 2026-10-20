@@ -545,3 +545,23 @@ def test_text_only_skips_vision(tiny_dir, monkeypatch):
     monkeypatch.setitem(globals(), "_vllm_config", text_only)
     _, model, _ = _build(tiny_dir)
     assert not model.has_vision and not hasattr(model.model, "visual")
+
+
+def test_vision_bucketed_encode_matches_exact(tiny_dir):
+    """embed_multimodal pads each grid's patches to a power-of-two bucket
+    (padding is its own attention segment, sliced off): the same embeddings
+    as encoding the exact grid, and grids sharing a bucket share a compile."""
+    import torch
+    _, model, _ = _build(tiny_dir)
+    rng = np.random.default_rng(1)
+    for grid in [(1, 4, 6), (1, 6, 4), (2, 4, 4), (1, 10, 6)]:
+        n = int(np.prod(grid))
+        x = jnp.asarray(rng.standard_normal((n, 3 * 2 * 14 * 14)), jnp.float32)
+        exact = np.asarray(model.model.visual(x, grid))
+        mm = model.embed_multimodal(pixel_values=torch.as_tensor(
+            np.asarray(x)),
+                                    image_grid_thw=torch.tensor([grid]))
+        np.testing.assert_allclose(np.asarray(mm[0]),
+                                   exact,
+                                   rtol=1e-5,
+                                   atol=1e-5)
