@@ -283,7 +283,7 @@ def ragged_kda_spec(q, k, v, g, beta, recurrent_state, query_start_loc,
     chunked pass runs with each request's last <= group tokens made no-ops
     (beta = 0, g = 0), which gives the state before them; those tokens then
     run recurrently, writing the state after each one."""
-    T, dk = q.shape[0], k.shape[-1]
+    T = q.shape[0]
     read, idx, ok, write = spec_slots(positions, query_start_loc,
                                       state_indices, distribution, group)
     in_window = jnp.zeros(T, bool).at[idx].max(ok)
@@ -301,9 +301,17 @@ def ragged_kda_spec(q, k, v, g, beta, recurrent_state, query_start_loc,
                                     has_initial_state,
                                     chunk_size=chunk_size)
     S = state[read].astype(jnp.float32)  # before each request's window
+    return _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write)
+
+
+def _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write):
+    """Runs each request's window tokens (idx [R, group], valid ok) from its
+    state S [R, H, dk, dv] f32, writing every token's output into out and the
+    state after it into its write slot."""
+    T, dk = q.shape[0], k.shape[-1]
     qn, kn = _l2norm(q) * (dk**-0.5), _l2norm(k)
-    oob = recurrent_state.shape[0]
-    for t in range(group):
+    oob = state.shape[0]
+    for t in range(idx.shape[1]):
         i = idx[:, t]
         S_new, o = _decode_step(S, qn[i], kn[i], v[i], g[i], beta[i])
         m = ok[:, t]
@@ -313,6 +321,21 @@ def ragged_kda_spec(q, k, v, g, beta, recurrent_state, query_start_loc,
                                    oob)].set(S.astype(state.dtype),
                                              mode="drop")
     return state, out
+
+
+def ragged_kda_windows(q, k, v, g, beta, recurrent_state, query_start_loc,
+                       state_indices, distribution, has_initial_state,
+                       positions, *, group: int):
+    """A step where every request has at most `group` tokens (a speculative
+    verify step): all tokens run recurrently from the read slots, without
+    the chunked pass (which pads every request to a whole chunk)."""
+    read, idx, ok, write = spec_slots(positions, query_start_loc,
+                                      state_indices, distribution, group)
+    S = recurrent_state[read].astype(jnp.float32)
+    S = jnp.where(has_initial_state[:, None, None, None], S, 0.0)
+    out = jnp.zeros(v.shape, jnp.float32)
+    return _recurrent_windows(S, recurrent_state, out, q, k, v, g, beta, idx,
+                              ok, write)
 
 
 def ragged_kda_decode_spec(q, k, v, g, beta, recurrent_state, positions,
@@ -349,13 +372,23 @@ def ragged_kda(q,
     spec_group > 1: the speculative-decoding slot groups (positions needed)."""
     T, max_reqs = q.shape[0], state_indices.shape[0]
     if spec_group > 1:
-        spec = functools.partial(ragged_kda_spec,
-                                 group=spec_group,
-                                 chunk_size=chunk_size)
         args = (q, k, v, g, beta, recurrent_state, query_start_loc,
                 state_indices, distribution, has_initial_state, positions)
+        lens = jnp.where(
+            jnp.arange(max_reqs) < distribution[2], jnp.diff(query_start_loc),
+            0)
+
+        def spec_or_windows():
+            # a verify step (every request <= spec_group tokens) needs no
+            # chunked pass
+            return lax.cond(
+                jnp.max(lens) <= spec_group,
+                lambda: ragged_kda_windows(*args, group=spec_group),
+                lambda: ragged_kda_spec(
+                    *args, group=spec_group, chunk_size=chunk_size))
+
         if T > max_reqs:
-            return spec(*args)
+            return spec_or_windows()
         return lax.cond(
             distribution[0] == distribution[2],
             lambda: ragged_kda_decode_spec(q,
@@ -367,8 +400,7 @@ def ragged_kda(q,
                                            positions,
                                            state_indices,
                                            distribution,
-                                           group=spec_group),
-            lambda: spec(*args))
+                                           group=spec_group), spec_or_windows)
     chunked = functools.partial(ragged_kda_chunked, chunk_size=chunk_size)
     if T > max_reqs:  # cannot be decode-only
         return chunked(q, k, v, g, beta, recurrent_state, query_start_loc,
