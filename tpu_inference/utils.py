@@ -544,6 +544,9 @@ def device_array(mesh: Mesh, *args, sharding=None, **kwargs) -> jax.Array:
     """
     if sharding is None:
         sharding = NamedSharding(mesh, PartitionSpec(None))
+    elif isinstance(sharding, PartitionSpec):
+        # multi-host puts (jax.make_array_from_callback) need the mesh
+        sharding = NamedSharding(mesh, sharding)
     return general_device_put(*args, sharding=sharding, **kwargs)
 
 
