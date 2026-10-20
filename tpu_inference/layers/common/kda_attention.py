@@ -300,8 +300,10 @@ def ragged_kda_spec(q, k, v, g, beta, recurrent_state, query_start_loc,
                                     distribution,
                                     has_initial_state,
                                     chunk_size=chunk_size)
-    S = state[read].astype(jnp.float32)  # before each request's window
-    return _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write)
+    R = min(state_indices.shape[0], T)  # rows that can hold a request
+    S = state[read[:R]].astype(jnp.float32)  # before each request's window
+    return _recurrent_windows(S, state, out, q, k, v, g, beta, idx[:R], ok[:R],
+                              write[:R])
 
 
 def _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write):
@@ -329,10 +331,12 @@ def ragged_kda_windows(q, k, v, g, beta, recurrent_state, query_start_loc,
     """A step where every request has at most `group` tokens (a speculative
     verify step): all tokens run recurrently from the read slots, without
     the chunked pass (which pads every request to a whole chunk)."""
-    read, idx, ok, write = spec_slots(positions, query_start_loc,
-                                      state_indices, distribution, group)
+    # every valid request has a token: at most T of the max_reqs rows matter
+    R = min(state_indices.shape[0], q.shape[0])
+    read, idx, ok, write = spec_slots(positions, query_start_loc[:R + 1],
+                                      state_indices[:R], distribution, group)
     S = recurrent_state[read].astype(jnp.float32)
-    S = jnp.where(has_initial_state[:, None, None, None], S, 0.0)
+    S = jnp.where(has_initial_state[:R, None, None, None], S, 0.0)
     out = jnp.zeros(v.shape, jnp.float32)
     return _recurrent_windows(S, recurrent_state, out, q, k, v, g, beta, idx,
                               ok, write)
@@ -458,8 +462,10 @@ def kda_conv_and_core(qkv,
                                 has_init,
                                 kernel_size=kernel_size)
     if spec_group > 1:
-        new_conv = _write_conv_checkpoints(new_conv, qkv, prev,
-                                           query_start_loc, idx, ok, write)
+        R = min(state_indices.shape[0], qkv.shape[0])
+        new_conv = _write_conv_checkpoints(new_conv, qkv, prev[:R],
+                                           query_start_loc[:R + 1], idx[:R],
+                                           ok[:R], write[:R])
     x = jax.nn.silu(x.astype(jnp.float32))
     T, C = x.shape[0], num_heads * head_dim
     q, k, v = (x[:, i * C:(i + 1) * C].reshape(T, num_heads, head_dim)

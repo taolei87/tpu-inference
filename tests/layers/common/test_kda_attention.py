@@ -343,7 +343,8 @@ def _spec_step(stream,
     return conv, rec, out
 
 
-def test_spec_decode_slot_groups_match_accepted_stream():
+@pytest.mark.parametrize("max_reqs", [4, 16])
+def test_spec_decode_slot_groups_match_accepted_stream(max_reqs):
     """Speculative decoding with slot groups of 4 (3 drafts): a prefill, a
     verify window whose last two drafts are rejected (garbage inputs) next
     to a 1-token decode, a decode-only step, then full windows. Each
@@ -379,7 +380,13 @@ def test_spec_decode_slot_groups_match_accepted_stream():
     ]
     keep = [None, {0: 2, 1: 1}, None, {0: 4, 1: 2}, None]
     for step, k in zip(steps, keep):
-        conv, rec, out = _spec_step(stream, step, conv, rec, slots, group)
+        conv, rec, out = _spec_step(stream,
+                                    step,
+                                    conv,
+                                    rec,
+                                    slots,
+                                    group,
+                                    max_reqs=max_reqs)
         for r, p0, t in step:
             m = len(t) if k is None else k[r]
             acc[r].append(out[r][:m])
