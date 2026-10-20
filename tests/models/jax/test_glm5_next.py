@@ -124,15 +124,23 @@ class _Caches:
     """The per-layer caches the runner allocates (glm5_next_kv_cache layout)
     and one AttentionMetadata per scheduler step."""
 
-    def __init__(self, text, dtype=jnp.float32, seed=0, latent_dtype=None):
-        lay = KV.Glm5NextCacheLayout.from_config(text, None)
+    def __init__(self,
+                 text,
+                 dtype=jnp.float32,
+                 seed=0,
+                 latent_dtype=None,
+                 num_spec=0):
+        lay = KV.Glm5NextCacheLayout.from_config(text, None, num_spec=num_spec)
         self.lay = lay
         rng = np.random.default_rng(seed)
         self.num_pages = MAX_REQS * PAGES_PER_SEQ + 1
         self.block_tables = rng.permutation(np.arange(
             1, self.num_pages)).astype(np.int32)
-        self.slots = rng.permutation(np.arange(1, MAX_REQS + 2))[:MAX_REQS]
-        slots, kvr = MAX_REQS + 2, -(-text.kv_lora_rank // 128) * 128
+        # each request owns a group of num_spec + 1 slots (base = its slot)
+        group = num_spec + 1
+        self.slots = (1 + group * rng.permutation(MAX_REQS)).astype(np.int32)
+        slots = group * MAX_REQS + 2
+        kvr = -(-text.kv_lora_rank // 128) * 128
         self.kv_caches, self.index = [], {}
         for i in range(text.num_hidden_layers):
             if i in lay.kda_layers:
@@ -625,3 +633,75 @@ def test_mtp_layer_matches_reference(tiny_dir):
     with jax.set_mesh(mesh):
         h = np.asarray(fwd(mtp, kv, tok, hid, md))[:len(nxt)]
     assert _rel(h, ref[0]) < 1e-4
+
+
+def test_spec_decode_rejected_drafts_leave_no_trace(tmp_path, monkeypatch):
+    """The whole model with speculative-decoding state (slot groups of 4,
+    ring tails, index_topk 16 so the indexer selects): request 0 runs a
+    verify window whose 3 drafts are junk and rejected, then resumes after
+    the one accepted token, while request 1 decodes alongside. Every accepted
+    token's hidden state and logits equal the reference over the true
+    tokens: KDA states, the indexer tail and the MLA latents roll back."""
+    from tpu_inference.layers.jax.attention import kda as kda_layer
+    monkeypatch.setattr(kda_layer, "_spec_group", lambda: 4)
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=23, index_topk=16)
+    vllm_config, model, mesh = _build(d)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(12)
+    ids = {
+        0: rng.integers(0, text.vocab_size, 22),
+        1: rng.integers(0, text.vocab_size, 14)
+    }
+    ref = _reference(d, ids, sparse="always")
+    caches = _Caches(text, num_spec=3)
+    junk = rng.integers(0, text.vocab_size, 3)
+    seqs = {0: np.concatenate([ids[0][:14], junk, ids[0][14:]]), 1: ids[1]}
+
+    def window(rid, p0, n, start):  # rows start.. of seqs[rid] at p0..
+        return (rid, p0, n), seqs[rid][start:start + n]
+
+    steps = [
+        [window(0, 0, 13, 0), window(1, 0, 9, 0)],
+        # r0: true token 13 + 3 junk drafts (only 13 accepted); r1 decodes
+        [window(1, 9, 1, 9), window(0, 13, 4, 13)],
+        [window(1, 10, 1, 10), window(0, 14, 8, 17)],
+        [window(1, 11, 3, 11)],
+    ]
+    keep = [None, {0: 1, 1: 1}, None, None]
+    got = {0: ([], []), 1: ([], [])}
+    for step, k in zip(steps, keep):
+        sched = [w for w, _ in step]
+        seq_ids = {w[0]: t for w, t in step}
+        out = _run_spec(model, mesh, caches, sched, seq_ids)
+        for rid, p0, n in sched:
+            m = n if k is None else k[rid]
+            got[rid][0].append(out[rid][0][:m])
+            got[rid][1].append(out[rid][1][:m])
+    for rid in ids:
+        h, logits = (np.concatenate(x) for x in got[rid])
+        assert h.shape[0] == len(ids[rid]), rid
+        assert _rel(h, ref[rid][0]) < 1e-4, rid
+        assert _rel(logits, ref[rid][1]) < 1e-4, rid
+
+
+def _run_spec(model, mesh, caches, step, toks):
+    """_run with explicit tokens per scheduled request."""
+    md, T = caches.metadata(step)
+    tokens = np.concatenate([toks[rid] for rid, _, _ in step])
+    tokens = np.pad(tokens, (0, T - len(tokens)))
+    names = tuple(caches.index.items())
+
+    @jax.jit
+    def fwd(model, kv, tok, md):
+        kv, h, _, _ = model(kv, tok, md, None, None, names)
+        return kv, h, model.compute_logits(h)
+
+    with jax.set_mesh(mesh):
+        caches.kv_caches, h, logits = fwd(model, caches.kv_caches,
+                                          jnp.asarray(tokens), md)
+    out, t = {}, 0
+    for rid, p0, n in step:
+        out[rid] = (np.asarray(h[t:t + n]), np.asarray(logits[t:t + n]))
+        t += n
+    return out
