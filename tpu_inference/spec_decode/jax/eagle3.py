@@ -331,9 +331,7 @@ class Eagle3Proposer:
             f"{self.method} requires auxiliary hidden states from the target model."
         )
 
-        # The last KV cache group is for the draft model.
-        num_kv_cache_groups = len(self.runner.kv_cache_config.kv_cache_groups)
-        draft_kv_cache_group_id = num_kv_cache_groups - 1
+        draft_kv_cache_group_id = self._draft_kv_cache_group_id()
         block_tables = self.runner.input_batch.block_table[
             draft_kv_cache_group_id].get_cpu_tensor().reshape(-1)
         block_tables = device_array(self.mesh,
@@ -352,6 +350,19 @@ class Eagle3Proposer:
             next_prompt_token_id=next_prompt_token_id,
             is_in_prefill=is_in_prefill,
             num_rejected_tokens=num_rejected_tokens)
+
+    def _draft_kv_cache_group_id(self) -> int:
+        """The KV cache group holding the draft model's layers: the one with
+        the draft model's `draft_layer_names[0]` if it names them (e.g.
+        GLM-5.3-Flash's MTP layer shares the target's cache grouping), else
+        the last group."""
+        groups = self.runner.kv_cache_config.kv_cache_groups
+        names = getattr(self.model, "draft_layer_names", None)
+        if names:
+            for i, group in enumerate(groups):
+                if names[0] in group.layer_names:
+                    return i
+        return len(groups) - 1
 
     @jax.jit(static_argnums=(0, ))
     def _prepare_inputs(

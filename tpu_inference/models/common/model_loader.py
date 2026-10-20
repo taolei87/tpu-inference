@@ -84,6 +84,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.gemma4_mtp import Gemma4MTPForCausalLM
     from tpu_inference.models.jax.glm5_next import (
         Glm5NextForCausalLM, Glm5NextForConditionalGeneration)
+    from tpu_inference.models.jax.glm5_next_mtp import Glm5NextMTPModel
     from tpu_inference.models.jax.gpt_oss import GptOss
     from tpu_inference.models.jax.llama3 import LlamaForCausalLM
     from tpu_inference.models.jax.llama4 import Llama4ForCausalLM
@@ -112,6 +113,7 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     _MODEL_REGISTRY[
         "Glm5NextForConditionalGeneration"] = Glm5NextForConditionalGeneration
     _MODEL_REGISTRY["DFlashDraftModel"] = DFlashForCausalLM
+    _MODEL_REGISTRY["Glm5NextMTPModel"] = Glm5NextMTPModel
 
     architectures = getattr(config, "architectures", [])
     for arch in architectures:

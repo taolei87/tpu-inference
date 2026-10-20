@@ -304,3 +304,26 @@ def test_manager_initialize_kv_cache_dispatches(tiny_dir, monkeypatch):
     mla = G.layer_name(2)  # tiny layer 2 is MLA
     latent, pooled = runner.kv_caches[runner.layer_name_to_kvcache_index[mla]]
     assert pooled.ndim == 3
+
+
+def test_specs_with_mtp_speculative_decoding(tiny_dir, monkeypatch):
+    """method='mtp' with 3 drafts: the MTP layer (index num_hidden_layers)
+    gets an MLA spec and an indexer tail; the tails are rings of kpool + 3
+    rounded up to kpool; the KDA specs reserve the drafts' slots."""
+    vllm_config = _vllm_config(tiny_dir)
+    runner = _runner(vllm_config, _mesh(1))
+    runner.speculative_config = types.SimpleNamespace(method="mtp",
+                                                      num_speculative_tokens=3)
+    monkeypatch.setattr("tpu_inference.utils.hbm_usage_bytes",
+                        lambda devices: [(0, HBM_PER_DEVICE) for _ in devices])
+    specs = G.get_glm5_next_kv_cache_spec(KVCacheManager(runner))
+    text = vllm_config.model_config.hf_text_config
+    lay = G.Glm5NextCacheLayout.from_config(text, torch.bfloat16)
+    L = text.num_hidden_layers
+    assert isinstance(specs[G.layer_name(L)], MLAAttentionSpec)
+    ring = -(-(lay.index_kpool + 3) // lay.index_kpool) * lay.index_kpool
+    for i in list(lay.mla_layers) + [L]:
+        assert specs[G.indexer_tail_name(i)].shapes == ((ring,
+                                                         lay.tail_shape[1]), )
+    assert specs[G.layer_name(lay.kda_layers[0])].num_speculative_blocks == 3
+    assert len({s.page_size_bytes for s in specs.values()}) == 1

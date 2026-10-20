@@ -185,6 +185,16 @@ def _set_latent_packing(layout, kv_cache_dtype) -> None:
     os.environ["MLA_KV_PACKING_SIZE"] = str(layout.index_kpool)
 
 
+def _mla_cache_layers(text_config, layout, speculative_config) -> list[int]:
+    """The layers with MLA caches: the decoder's, plus the MTP draft layer
+    (index num_hidden_layers) under method='mtp'."""
+    layers = list(layout.mla_layers)
+    if (speculative_config is not None and speculative_config.method == "mtp"
+            and speculative_config.num_speculative_tokens):
+        layers.append(text_config.num_hidden_layers)
+    return layers
+
+
 def get_glm5_next_kv_cache_spec(
         manager: "KVCacheManager") -> dict[str, KVCacheSpec]:
     """The flax_nnx path's per-layer KV cache specs for GLM-5.3-Flash."""
@@ -197,9 +207,10 @@ def get_glm5_next_kv_cache_spec(
             "decode context parallelism is not supported for GLM-5.3-Flash")
     num_spec = (runner.speculative_config.num_speculative_tokens
                 if runner.speculative_config else 0)
-    if num_spec:
+    if num_spec and runner.speculative_config.method != "mtp":
         raise NotImplementedError(
-            "speculative decoding is not supported for GLM-5.3-Flash yet")
+            "GLM-5.3-Flash speculative decoding supports method='mtp' only, "
+            f"got {runner.speculative_config.method!r}")
 
     layout = Glm5NextCacheLayout.from_config(text_config,
                                              _model_dtype(runner),
@@ -213,7 +224,9 @@ def get_glm5_next_kv_cache_spec(
                    torch.tensor([], dtype=layout.tail_dtype).element_size())
     attn_page = latent_page + pooled_page
     kda_page, tail_page = layout.kda_page_bytes, layout.tail_page_bytes
-    n_mla, n_kda = len(layout.mla_layers), len(layout.kda_layers)
+    mla_layers = _mla_cache_layers(text_config, layout,
+                                   runner.speculative_config)
+    n_mla, n_kda = len(mla_layers), len(layout.kda_layers)
 
     # One uniform page size for every spec: the per-KVCacheTensor footprint of
     # vLLM's grouping (one layer from each group), as for other hybrid models.
@@ -240,7 +253,7 @@ def get_glm5_next_kv_cache_spec(
                         mamba_cache_mode=cache_config.mamba_cache_mode,
                         num_speculative_blocks=num_spec)
     specs: dict[str, KVCacheSpec] = {}
-    for i in range(text_config.num_hidden_layers):
+    for i in sorted(set(layout.kda_layers) | set(mla_layers)):
         if i in layout.kda_layers:
             specs[layer_name(i)] = MambaSpec(shapes=(layout.conv_shape,
                                                      layout.state_shape),
@@ -306,7 +319,9 @@ def initialize_glm5_next_kv_cache(manager: "KVCacheManager",
         num_blocks_list.append(n)
         runner.layer_name_to_kvcache_index[name] = len(kv_caches) - 1
 
-    for i in range(text_config.num_hidden_layers):
+    mla_layers = _mla_cache_layers(text_config, layout,
+                                   runner.speculative_config)
+    for i in sorted(set(layout.kda_layers) | set(mla_layers)):
         name = layer_name(i)
         spec = layer_name_to_spec[name]
         if isinstance(spec, MambaSpec):  # KDA

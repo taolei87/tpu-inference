@@ -175,9 +175,17 @@ class Glm5NextMTPModel(JaxModule, LoadableWithIterator):
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         return self.lm_head(hidden_states)
 
+    @property
+    def draft_layer_names(self) -> Tuple[str, str]:
+        """The KV cache names of the MTP layer (its MLA, its indexer tail):
+        the proposer takes the draft's block table from their group."""
+        return (glm5_next_kv_cache.layer_name(self.mtp_idx),
+                glm5_next_kv_cache.indexer_tail_name(self.mtp_idx))
+
     def load_weights(self, weights: Iterable[Tuple[str, Any]]) -> set:
-        """The MTP layer (renamed to `model.mtp.`), the embedding and lm_head;
-        everything else in the checkpoint is skipped."""
+        """The MTP layer (renamed to `model.mtp.`) and lm_head; everything
+        else in the checkpoint is skipped. The token embedding stays unloaded
+        (zeros): the proposer then shares the target model's."""
         mtp = f"model.layers.{self.mtp_idx}."
         mapper = WeightsMapper(orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -187,7 +195,7 @@ class Glm5NextMTPModel(JaxModule, LoadableWithIterator):
             name, w = item
             if name.startswith(mtp):
                 return ("model.mtp." + name[len(mtp):], w)
-            if name in ("model.embed_tokens.weight", "lm_head.weight"):
+            if name == "lm_head.weight":
                 return item
             return None
 
