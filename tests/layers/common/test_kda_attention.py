@@ -401,3 +401,17 @@ def test_spec_decode_slot_groups_match_accepted_stream(max_reqs):
         last = slots[r] + (total - 1) % group
         assert _rel(np.asarray(rec[last]), ref_rec[0]) < 1e-4, r
         assert _rel(np.asarray(conv[last]), ref_conv[0]) < 1e-5, r
+
+
+def test_decode_only_batch_padded_past_max_reqs():
+    """A decode-only step padded past max_reqs (decode buckets start at 16
+    tokens; max_num_seqs may be 8): the decode path on the first max_reqs
+    tokens, same result."""
+    rng = np.random.default_rng(5)
+    b = _batch(rng,
+               lens=[1, 1],
+               has_state=[True, True],
+               max_reqs=2,
+               num_slots=5,
+               pad_tokens=6)
+    _check(b, *_run_local(b))

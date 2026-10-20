@@ -215,7 +215,8 @@ def ragged_kda_decode(q, k, v, g, beta, recurrent_state, state_indices,
                       distribution):
     """One recurrent KDA step per request; token i belongs to request i.
 
-    Shapes as in `ragged_kda_chunked` (T <= max_reqs here); tokens at
+    Shapes as in `ragged_kda_chunked` (T <= max_reqs: the caller passes the
+    first max_reqs tokens of a padded decode step); tokens at
     i >= distribution[2] are padding and leave the state untouched.
     """
     T = q.shape[0]
@@ -391,28 +392,38 @@ def ragged_kda(q,
                 lambda: ragged_kda_spec(
                     *args, group=spec_group, chunk_size=chunk_size))
 
-        if T > max_reqs:
-            return spec_or_windows()
-        return lax.cond(
-            distribution[0] == distribution[2],
-            lambda: ragged_kda_decode_spec(q,
-                                           k,
-                                           v,
-                                           g,
-                                           beta,
-                                           recurrent_state,
-                                           positions,
-                                           state_indices,
-                                           distribution,
-                                           group=spec_group), spec_or_windows)
+        R = min(T, max_reqs)
+
+        def decode_spec():
+            state, out = ragged_kda_decode_spec(q[:R],
+                                                k[:R],
+                                                v[:R],
+                                                g[:R],
+                                                beta[:R],
+                                                recurrent_state,
+                                                positions[:R],
+                                                state_indices,
+                                                distribution,
+                                                group=spec_group)
+            return state, jnp.pad(out, ((0, T - R), (0, 0), (0, 0)))
+
+        return lax.cond(distribution[0] == distribution[2], decode_spec,
+                        spec_or_windows)
     chunked = functools.partial(ragged_kda_chunked, chunk_size=chunk_size)
-    if T > max_reqs:  # cannot be decode-only
-        return chunked(q, k, v, g, beta, recurrent_state, query_start_loc,
-                       state_indices, distribution, has_initial_state)
+    # A decode-only step has at most max_reqs real tokens (one per request),
+    # even when the step is padded past max_reqs (decode buckets start at 16
+    # tokens): run the decode path on the first R tokens.
+    R = min(T, max_reqs)
+
+    def decode():
+        state, out = ragged_kda_decode(q[:R], k[:R], v[:R], g[:R], beta[:R],
+                                       recurrent_state, state_indices,
+                                       distribution)
+        return state, jnp.pad(out, ((0, T - R), (0, 0), (0, 0)))
+
     return lax.cond(
         distribution[0] == distribution[2],
-        lambda: ragged_kda_decode(q, k, v, g, beta, recurrent_state,
-                                  state_indices, distribution),
+        decode,
         lambda: chunked(q, k, v, g, beta, recurrent_state, query_start_loc,
                         state_indices, distribution, has_initial_state),
     )
