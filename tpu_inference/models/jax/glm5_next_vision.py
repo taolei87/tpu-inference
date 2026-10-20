@@ -38,6 +38,7 @@ from jax.sharding import Mesh
 
 from tpu_inference.layers.common.attention_interface import \
     sharded_flash_attention
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax import JaxModule
 
 init_fn = nnx.initializers.uniform()
@@ -49,9 +50,17 @@ class _Node(JaxModule):
     """A named level of the HF module tree (e.g. `attn.qkv`) holding params."""
 
 
-def _param(rng, shape, dtype):
+# Big weights are split over the tensor-parallel axes (columns of the
+# input-side projections, rows of the output-side ones) so the ~1.1 GB tower
+# doesn't take its full size from every chip's KV cache; XLA inserts the
+# collectives. Norms and the small patch embedding stay replicated.
+TP = ShardingAxisName.ATTN_HEAD
+COLS, ROWS = (None, TP), (TP, None)
+
+
+def _param(rng, shape, dtype, sharding=None):
     return nnx.Param(init_fn(rng.params(), shape, dtype),
-                     out_sharding=(None, ) * len(shape),
+                     out_sharding=sharding or (None, ) * len(shape),
                      eager_sharding=False)
 
 
@@ -117,14 +126,14 @@ class Glm5NextVisionAttention(JaxModule):
     def __init__(self, dim: int, num_heads: int, eps: float, dtype, rng):
         self.num_heads, self.head_dim, self.eps = num_heads, dim // num_heads, eps
         self.qkv = _Node()
-        self.qkv.weight = _param(rng, (dim, 3 * dim), dtype)
+        self.qkv.weight = _param(rng, (dim, 3 * dim), dtype, COLS)
         self.qkv.bias = _param(rng, (3 * dim, ), dtype)
         self.q_norm = _Node()
         self.q_norm.weight = _param(rng, (self.head_dim, ), dtype)
         self.k_norm = _Node()
         self.k_norm.weight = _param(rng, (self.head_dim, ), dtype)
         self.proj = _Node()
-        self.proj.weight = _param(rng, (dim, dim), dtype)
+        self.proj.weight = _param(rng, (dim, dim), dtype, ROWS)
         self.proj.bias = _param(rng, (dim, ), dtype)
 
     def __call__(self, x, cos, sin, segments, attend):
@@ -153,7 +162,8 @@ class Glm5NextVisionMLP(JaxModule):
                             ("up_proj", (dim, hidden)), ("down_proj", (hidden,
                                                                        dim))):
             m = _Node()
-            m.weight = _param(rng, shape, dtype)
+            m.weight = _param(rng, shape, dtype,
+                              ROWS if name == "down_proj" else COLS)
             if bias:
                 m.bias = _param(rng, (shape[1], ), dtype)
             setattr(self, name, m)
@@ -223,12 +233,13 @@ class Glm5NextVisionModel(JaxModule):
         self.post_layernorm = _Node()
         self.post_layernorm.weight = _param(rng, (dim, ), dtype)
         self.downsample = _Node()
-        self.downsample.weight = _param(rng, (out, dim, m, m), dtype)
+        self.downsample.weight = _param(rng, (out, dim, m, m), dtype,
+                                        (TP, None, None, None))
         self.downsample.bias = _param(rng, (out, ), dtype)
         self.merger = Glm5NextVisionMLP(out, cfg.projection_intermediate_size,
                                         cfg.swiglu_limit, dtype, rng, False)
         self.merger.proj = _Node()
-        self.merger.proj.weight = _param(rng, (out, out), dtype)
+        self.merger.proj.weight = _param(rng, (out, out), dtype, COLS)
         self.merger.post_projection_norm = _Node()
         self.merger.post_projection_norm.weight = _param(rng, (out, ), dtype)
         self.merger.post_projection_norm.bias = _param(rng, (out, ), dtype)

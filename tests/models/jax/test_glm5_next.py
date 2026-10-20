@@ -457,14 +457,15 @@ def test_moe_token_splits(tiny_dir, monkeypatch):
     np.testing.assert_allclose(two[0][0], one[0][0], rtol=1e-5, atol=1e-5)
 
 
-def test_image_prompt_matches_hf(tiny_dir):
+@pytest.mark.parametrize("tp", [1, 2])
+def test_image_prompt_matches_hf(tiny_dir, tp):
     """An image prompt end to end: the vision tower's embeddings merged over
     the image tokens (embed_multimodal -> embed_input_ids -> the model on
     inputs_embeds) give transformers' logits."""
     import torch
     from transformers import \
         Glm5NextForConditionalGeneration as HFGlm5NextForConditionalGeneration
-    vllm_config, model, mesh = _build(tiny_dir)
+    vllm_config, model, mesh = _build(tiny_dir, tp)
     assert model.has_vision
     hf_cfg = vllm_config.model_config.hf_config
     grid = (1, 4, 6)  # patches; 6 image tokens after the 2x2 merge
