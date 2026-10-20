@@ -739,6 +739,9 @@ class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
             if pixels is None:
                 continue
             pixels, grids = _as_patches(pixels), _as_grids(grids)
+            if self.mesh is not None:  # host -> replicated over the mesh
+                pixels = jax.device_put(
+                    pixels, jax.sharding.NamedSharding(self.mesh, P()))
             start = 0
             for grid in grids:
                 n = int(np.prod(grid))
