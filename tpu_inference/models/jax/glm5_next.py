@@ -32,6 +32,8 @@ from typing import Any, Iterable, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+import torch
 from flax import nnx
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
@@ -47,12 +49,17 @@ from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.moe.moe import JaxRoutedExperts
 from tpu_inference.layers.jax.norm import JaxLayerNorm, JaxRmsNorm
+from tpu_inference.logger import init_logger
+from tpu_inference.models.jax.glm5_next_vision import Glm5NextVisionModel
+from tpu_inference.models.jax.utils.multi_modal_utils import \
+    merge_multimodal_embeddings
 from tpu_inference.models.jax.utils.weight_utils import (
     JaxAutoWeightsLoader, LoadableWithIterator,
     load_nnx_param_from_reshaped_torch)
 from tpu_inference.runner import glm5_next_kv_cache
 from tpu_inference.utils import get_mesh_shape_product
 
+logger = init_logger(__name__)
 init_fn = nnx.initializers.uniform()
 
 # GLM5_MOE_TOKEN_SPLITS applies to steps of at least this many tokens
@@ -649,21 +656,141 @@ class Glm5NextForCausalLM(JaxModule, LoadableWithIterator):
         return self.lm_head(hidden_states)
 
     def load_weights(self, weights: Iterable[Tuple[str, Any]]) -> set:
+        # the vision tower is built by Glm5NextForConditionalGeneration only
+        return self._load_weights(weights, skip_prefixes=["model.visual."])
+
+    def _load_weights(self, weights, skip_prefixes) -> set:
         num_layers = self.model.config.num_hidden_layers
         mapper = WeightsMapper(
             orig_to_new_prefix={"model.language_model.": "model."})
 
         def keep(name: str) -> bool:
-            # MTP (NextN) layers sit after the decoder layers; vision and MTP
-            # are not built yet.
+            # MTP (NextN) layers sit after the decoder layers and are not
+            # built yet.
             m = re.match(r"model\.layers\.(\d+)\.", name)
             return not (m and int(m.group(1)) >= num_layers)
 
         weights = ((n, w) for n, w in mapper.apply(weights) if keep(n))
-        loader = JaxAutoWeightsLoader(self, skip_prefixes=["model.visual."])
+        loader = JaxAutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
 
 
 class Glm5NextForConditionalGeneration(Glm5NextForCausalLM):
-    """The checkpoint's architecture; text-only for now (the vision tower's
-    weights are skipped)."""
+    """The checkpoint's architecture: the text model plus the vision tower
+    (`model.visual`), which turns each image or video grid into text
+    embeddings for its `<|image|>` tokens. Without vision inputs enabled
+    (`language_model_only`, or no image/video allowed per prompt) the tower
+    isn't built and its weights are skipped."""
+
+    supports_multimodal = True
+
+    def __init__(self, vllm_config, rng_key: jax.Array, mesh: Mesh) -> None:
+        super().__init__(vllm_config, rng_key, mesh)
+        hf_config = vllm_config.model_config.hf_config
+        self.vision_config = getattr(hf_config, "vision_config", None)
+        self.image_token_id = getattr(hf_config, "image_token_id", None)
+        self.has_vision = (self.vision_config is not None
+                           and _vision_enabled(vllm_config.model_config))
+        if self.has_vision:
+            self.model.visual = Glm5NextVisionModel(
+                self.vision_config, vllm_config.model_config.dtype,
+                nnx.Rngs(jax.random.fold_in(rng_key, 1)), mesh)
+
+    def load_weights(self, weights: Iterable[Tuple[str, Any]]) -> set:
+        if self.has_vision:
+            return self._load_weights(weights, skip_prefixes=[])
+        return super().load_weights(weights)
+
+    # -- multimodal interface (models/common/interface.py) --
+
+    def embed_input_ids(
+            self,
+            input_ids: jax.Array,
+            multimodal_embeddings: Optional[jax.Array] = None,
+            *,
+            is_multimodal: Optional[jax.Array] = None) -> jax.Array:
+        """Token embeddings with the vision embeddings written over the
+        image tokens, in order (video frames use the image token too)."""
+        del is_multimodal
+        embeds = self.model.embed_tokens(input_ids)
+        if multimodal_embeddings is not None and multimodal_embeddings.shape[
+                0] > 0:
+            embeds = merge_multimodal_embeddings(
+                input_ids, embeds, multimodal_embeddings.astype(embeds.dtype),
+                self.image_token_id)
+        return embeds
+
+    @functools.partial(jax.jit, static_argnames=("grid", ))
+    def encode_grid(self, patches: jax.Array, grid: tuple) -> jax.Array:
+        """One image or video: patches [t * h * w, 1176] -> its embeddings
+        [t * h * w / 4, hidden] (one compile per grid)."""
+        return self.model.visual(patches, grid)
+
+    def embed_multimodal(self, **kwargs) -> Tuple[jax.Array, ...]:
+        """One embedding array per image / video item, in the kwargs' order
+        (`pixel_values` + `image_grid_thw`, `pixel_values_videos` +
+        `video_grid_thw`)."""
+        if not self.has_vision:
+            return ()
+        out = []
+        for pv_key, grid_key in (("pixel_values", "image_grid_thw"),
+                                 ("pixel_values_videos", "video_grid_thw")):
+            pixels, grids = kwargs.get(pv_key), kwargs.get(grid_key)
+            if pixels is None:
+                continue
+            pixels, grids = _as_patches(pixels), _as_grids(grids)
+            start = 0
+            for grid in grids:
+                n = int(np.prod(grid))
+                out.append(self.encode_grid(pixels[start:start + n], grid))
+                start += n
+            assert start == pixels.shape[0], (start, pixels.shape)
+        return tuple(out)
+
+    def precompile_vision_encoder(self, run_compilation_fn) -> None:
+        """Compiles the encoder for the image sizes in
+        `additional_config["vision_warmup_config"]["image_shapes"]` ([[H, W]]
+        in pixels, multiples of 28); other sizes compile on first use."""
+        if not self.has_vision:
+            return
+        extra = getattr(self.vllm_config, "additional_config", None) or {}
+        shapes = extra.get("vision_warmup_config", {}).get("image_shapes", [])
+        vc = self.vision_config
+        unit = vc.patch_size * vc.spatial_merge_size
+        width = vc.in_channels * vc.temporal_patch_size * vc.patch_size**2
+        for hw in shapes:
+            if (len(hw) != 2 or hw[0] % unit or hw[1] % unit):
+                logger.warning("skipping vision warm-up shape %s", hw)
+                continue
+            grid = (1, hw[0] // vc.patch_size, hw[1] // vc.patch_size)
+            patches = jnp.zeros((int(np.prod(grid)), width),
+                                self.vllm_config.model_config.dtype)
+            run_compilation_fn("vision_encoder",
+                               functools.partial(self.encode_grid, grid=grid),
+                               patches,
+                               image_shape=hw)
+
+
+def _vision_enabled(model_config) -> bool:
+    mm = getattr(model_config, "multimodal_config", None)
+    if mm is None:
+        return False
+    if getattr(mm, "language_model_only", False):
+        return False
+    return any(mm.get_limit_per_prompt(m) > 0 for m in ("image", "video"))
+
+
+def _as_patches(x) -> jax.Array:
+    if isinstance(x, (list, tuple)):
+        x = torch.cat([torch.as_tensor(a) for a in x])
+    if isinstance(x, torch.Tensor):
+        x = x.to(torch.float32).numpy()
+    return jnp.asarray(np.asarray(x).reshape(-1, np.asarray(x).shape[-1]))
+
+
+def _as_grids(g) -> Tuple[Tuple[int, int, int], ...]:
+    if isinstance(g, (list, tuple)) and g and isinstance(g[0], torch.Tensor):
+        g = torch.cat([torch.as_tensor(a).reshape(-1, 3) for a in g])
+    if isinstance(g, torch.Tensor):
+        g = g.tolist()
+    return tuple(tuple(int(v) for v in row) for row in np.reshape(g, (-1, 3)))

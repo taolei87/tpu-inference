@@ -447,3 +447,101 @@ def test_moe_token_splits(tiny_dir, monkeypatch):
     monkeypatch.setenv("GLM5_MOE_TOKEN_SPLITS", "2")
     two = _run(model, mesh, _Caches(text), [(0, 0, 30)], ids)
     np.testing.assert_allclose(two[0][0], one[0][0], rtol=1e-5, atol=1e-5)
+
+
+def test_image_prompt_matches_hf(tiny_dir):
+    """An image prompt end to end: the vision tower's embeddings merged over
+    the image tokens (embed_multimodal -> embed_input_ids -> the model on
+    inputs_embeds) give transformers' logits."""
+    import torch
+    from transformers import \
+        Glm5NextForConditionalGeneration as HFGlm5NextForConditionalGeneration
+    vllm_config, model, mesh = _build(tiny_dir)
+    assert model.has_vision
+    hf_cfg = vllm_config.model_config.hf_config
+    grid = (1, 4, 6)  # patches; 6 image tokens after the 2x2 merge
+    rng = np.random.default_rng(7)
+    pixels = torch.as_tensor(rng.standard_normal((24, 3 * 2 * 14 * 14)),
+                             dtype=torch.float32)
+    ids = np.array([5, 9, 17, hf_cfg.image_start_token_id] +
+                   [hf_cfg.image_token_id] * 6 +
+                   [hf_cfg.image_end_token_id, 33, 41, 2], np.int64)
+    hf = HFGlm5NextForConditionalGeneration.from_pretrained(
+        tiny_dir, dtype=torch.float32).eval()
+    with torch.no_grad():
+        ref = hf(input_ids=torch.as_tensor(ids[None]),
+                 pixel_values=pixels,
+                 image_grid_thw=torch.tensor([grid])).logits[0].numpy()
+
+    mm = model.embed_multimodal(pixel_values=pixels,
+                                image_grid_thw=torch.tensor([grid]))
+    assert len(mm) == 1 and mm[0].shape[0] == 6
+    text = vllm_config.model_config.hf_text_config
+    caches = _Caches(text)
+    md, T = caches.metadata([(0, 0, len(ids))])
+    tokens = jnp.asarray(np.pad(ids, (0, T - len(ids))).astype(np.int32))
+    embeds = model.embed_input_ids(tokens, jnp.concatenate(mm))
+    names = tuple(caches.index.items())
+
+    @jax.jit
+    def fwd(model, kv, tok, md, embeds):
+        kv, h, _, _ = model(kv, tok, md, embeds, None, names)
+        return model.compute_logits(h)
+
+    with jax.set_mesh(mesh):
+        logits = np.asarray(fwd(model, caches.kv_caches, tokens, md,
+                                embeds))[:len(ids)]
+    assert _rel(logits, ref) < 1e-4
+
+
+@pytest.mark.parametrize("grid", [(1, 4, 6), (2, 4, 4)])
+def test_vision_tower_matches_hf(grid):
+    """The vision tower alone against transformers' Glm5NextVisionModel
+    (random weights, same names): a single frame and a two-frame grid
+    (attention stays within each frame)."""
+    import torch
+    from flax import nnx
+    from transformers.models.glm5_next.configuration_glm5_next import \
+        Glm5NextVisionConfig
+    from transformers.models.glm5_next.modeling_glm5_next import \
+        Glm5NextVisionModel as HFVision
+
+    from tpu_inference.models.jax.glm5_next_vision import Glm5NextVisionModel
+    torch.manual_seed(0)
+    cfg = Glm5NextVisionConfig(depth=2,
+                               hidden_size=64,
+                               num_heads=4,
+                               intermediate_size=128,
+                               out_hidden_size=96,
+                               projection_intermediate_size=160)
+    hf = HFVision(cfg).float().eval()
+    with torch.no_grad():
+        for p in hf.parameters():
+            p.normal_(0, 0.05)
+    ours = Glm5NextVisionModel(cfg, jnp.float32, nnx.Rngs(0), None)
+    sd = hf.state_dict()
+    params = dict(ours.named_parameters())
+    assert set(params) == set(sd)
+    for name, p in params.items():  # the loader's convention
+        w = sd[name].numpy()
+        p.set_value(jnp.asarray(w.T if w.ndim == 2 else w))
+    x = torch.randn(int(np.prod(grid)), 3 * 2 * 14 * 14)
+    with torch.no_grad():
+        ref = hf(x, grid_thw=torch.tensor([grid])).pooler_output.numpy()
+    out = np.asarray(ours(jnp.asarray(x.numpy()), grid))
+    assert out.shape == ref.shape
+    assert _rel(out, ref) < 1e-5
+
+
+def test_text_only_skips_vision(tiny_dir, monkeypatch):
+    """language_model_only: no vision tower is built or loaded."""
+    make = _vllm_config
+
+    def text_only(*args, **kwargs):
+        cfg = make(*args, **kwargs)
+        cfg.model_config.multimodal_config.language_model_only = True
+        return cfg
+
+    monkeypatch.setitem(globals(), "_vllm_config", text_only)
+    _, model, _ = _build(tiny_dir)
+    assert not model.has_vision and not hasattr(model.model, "visual")
