@@ -183,9 +183,10 @@ class Glm5NextMTPModel(JaxModule, LoadableWithIterator):
                 glm5_next_kv_cache.indexer_tail_name(self.mtp_idx))
 
     def load_weights(self, weights: Iterable[Tuple[str, Any]]) -> set:
-        """The MTP layer (renamed to `model.mtp.`) and lm_head; everything
-        else in the checkpoint is skipped. The token embedding stays unloaded
-        (zeros): the proposer then shares the target model's."""
+        """The MTP layer (renamed to `model.mtp.`), the token embedding and
+        lm_head; everything else in the checkpoint is skipped. (The embedding
+        is loaded so every parameter is materialized; the proposer then finds
+        it equal to the target's and shares that one.)"""
         mtp = f"model.layers.{self.mtp_idx}."
         mapper = WeightsMapper(orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -195,7 +196,7 @@ class Glm5NextMTPModel(JaxModule, LoadableWithIterator):
             name, w = item
             if name.startswith(mtp):
                 return ("model.mtp." + name[len(mtp):], w)
-            if name == "lm_head.weight":
+            if name in ("model.embed_tokens.weight", "lm_head.weight"):
                 return item
             return None
 
