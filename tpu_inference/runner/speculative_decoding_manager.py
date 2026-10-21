@@ -48,6 +48,11 @@ class SpeculativeDecodingManager:
             return None
         req_ids = self.runner.input_batch.req_ids
         draft_token_ids = self._draft_token_ids
+        if not isinstance(draft_token_ids, list):
+            # Async scheduling keeps the drafts on device; the scheduler edits
+            # them in place as lists (update_draft_token_ids_in_output, used
+            # for structured-output requests).
+            draft_token_ids = np.asarray(draft_token_ids).tolist()
 
         if self._req_indices_dp is None:
             self._draft_token_ids = None

@@ -471,3 +471,26 @@ class TestSpeculativeDecodingManager:
         assert result == [[10, 11], [20, 21]]
         self.runner.drafter.prepare_inputs.assert_called_once()
         self.runner.drafter.propose.assert_called_once()
+
+
+def test_take_draft_token_ids_from_device_array():
+    """Async scheduling keeps the drafts on device; take_draft_token_ids
+    returns lists the scheduler can trim in place
+    (update_draft_token_ids_in_output, used for structured-output
+    requests)."""
+    from types import SimpleNamespace
+
+    import jax.numpy as jnp
+
+    from tpu_inference.runner.speculative_decoding_manager import \
+        SpeculativeDecodingManager
+    mgr = SpeculativeDecodingManager(
+        SimpleNamespace(input_batch=SimpleNamespace(req_ids=["a", "b"])))
+    mgr._draft_token_ids = jnp.asarray([[10, 11], [20, 21]], jnp.int32)
+    result = mgr.take_draft_token_ids()
+    assert result.req_ids == ["a", "b"]
+    assert result.draft_token_ids == [[10, 11], [20, 21]]
+    for row in result.draft_token_ids:
+        del row[1:]
+    assert result.draft_token_ids == [[10], [20]]
+    assert mgr.take_draft_token_ids() is None
