@@ -1723,6 +1723,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         # Later, the multi-modality model will take the embedding as the input.
         # For text-only model, this does nothing. It will input the input_ids and
         # leave the embedding job inside the forward pass
+        # The token ids stay available for speculative decoding (the
+        # rejection sampler reads the drafts from them, the drafter shifts
+        # them) when the model takes embeddings instead.
+        token_ids = input_ids
         input_ids, inputs_embeds = self._get_input_ids_embeds(
             input_ids, mm_embeds, is_mm_embed)
 
@@ -1827,7 +1831,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             attn_metadata=attn_metadata,
             shared_attn_metadata=shared_attn_metadata,
             sampling_metadata=sampling_metadata,
-            input_ids=input_ids,
+            input_ids=token_ids,
             hidden_states=hidden_states,
             logits=logits,
             aux_hidden_states=aux_hidden_states,

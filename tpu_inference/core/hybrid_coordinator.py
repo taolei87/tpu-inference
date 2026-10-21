@@ -127,11 +127,18 @@ class MambaBlockPool(BlockPool):
     group those shared cache entries are keyed to.
     """
 
-    def __init__(self, *args, primary_group_id: int | None = None, **kwargs):
+    def __init__(self,
+                 *args,
+                 primary_group_id: int | None = None,
+                 num_groups: int = 1,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         # When mamba groups are mirrored, every group's cache entry is keyed
         # to this one group id
         self.primary_group_id = primary_group_id
+        # Mirrored groups hold the same block objects: each group's
+        # allocation takes one reference
+        self.num_groups = num_groups
         # A one-slot buffer holding the block the
         # primary mamba group most recently pulled off the free queue
         self._last_allocation: list[KVCacheBlock] = []
@@ -157,6 +164,13 @@ class MambaBlockPool(BlockPool):
         blocks = super().get_new_blocks(num_blocks)
         self._last_allocation = list(blocks)
         return blocks
+
+    def is_block_writable(self, block: KVCacheBlock) -> bool:
+        """A block one request owns in every mirrored group holds one
+        reference per group (vLLM's MambaManager asks before relocating a
+        speculative block in align mode)."""
+        return (not block.is_null and block.ref_cnt == self.num_groups
+                and block.block_hash is None)
 
     def get_cached_block(self, block_hash: BlockHash,
                          kv_cache_group_ids: list[int]):
@@ -385,6 +399,8 @@ class TPUHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             metrics_collector=self.attention_block_pool.metrics_collector,
             primary_group_id=(self.primary_mamba_group_id
                               if self.mirror_mamba_groups else None),
+            num_groups=(len(self.mamba_group_ids)
+                        if self.mirror_mamba_groups else 1),
         )
         self._mirror_pool = (MirrorMambaBlockPool(self.mamba_block_pool)
                              if self.mirror_mamba_groups else None)

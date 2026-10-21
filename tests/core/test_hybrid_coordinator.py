@@ -205,6 +205,22 @@ class TestMirrorMambaBlockPool:
         # Only 2 ids were consumed, not 6.
         assert primary.get_num_free_blocks() == 12 - 1 - 2
 
+    def test_writable_counts_one_reference_per_mirrored_group(self):
+        """vLLM's MambaManager relocates a speculative block (align mode with
+        spec decode) only if is_block_writable: with mirrored groups a block
+        one request owns holds one reference per group."""
+        primary = MambaBlockPool(num_gpu_blocks=12,
+                                 enable_caching=True,
+                                 hash_block_size=16,
+                                 primary_group_id=1,
+                                 num_groups=2)
+        mirror = MirrorMambaBlockPool(primary)
+        (block, ) = primary.get_new_blocks(1)
+        mirror.get_new_blocks(1)
+        assert mirror.is_block_writable(block)
+        block.ref_cnt += 2  # another request shares it (a prefix hit)
+        assert not primary.is_block_writable(block)
+
     def test_mirror_refuses_to_alias_when_groups_diverge(self):
         primary, mirror = self._pools()
         primary.get_new_blocks(2)
