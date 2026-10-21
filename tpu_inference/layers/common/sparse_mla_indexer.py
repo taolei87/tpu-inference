@@ -46,7 +46,8 @@ from jax import lax
 from jax.sharding import PartitionSpec as P
 
 import tpu_inference.envs as envs
-from tpu_inference.layers.common.kda_attention import align_state_slots
+from tpu_inference.layers.common.kda_attention import (align_state_slots,
+                                                       spec_slots)
 from tpu_inference.layers.common.nope_mla_attention import (_cache_dims,
                                                             _token_requests,
                                                             write_latents)
@@ -103,7 +104,8 @@ def indexer_write(pooled,
                   query_start_loc,
                   distribution,
                   tail_slots,
-                  tail_read_slots=None):
+                  tail_read_slots=None,
+                  tail_window=None):
     """Pools the k-pools completed by this step's tokens into `pooled` and
     keeps the raw (k | gate) of every request's latest tokens in `tail`.
 
@@ -118,6 +120,13 @@ def indexer_write(pooled,
 
     tail_read_slots [max_reqs] (prefix caching; None: tail_slots): the slots
     the earlier tokens are read from, tail_slots then the ones written.
+
+    tail_window (prefix caching with speculative decoding): (write slots
+    [max_reqs, group], valid [max_reqs, group]) of each request's last
+    <= group positions (`kda_attention.spec_slots`). Each of those slots gets
+    the request's whole updated ring, so the next step finds it in the slot
+    of its first token's predecessor, whichever drafts were accepted
+    (entries of later positions in it are never read).
     """
     T, ihd = k.shape
     kp = ape.shape[0]
@@ -127,7 +136,7 @@ def indexer_write(pooled,
                                              query_start_loc, distribution,
                                              page_size)
     f32 = jnp.float32
-    slot = tail_slots[req]
+    slot = tail_slots[req] if tail_window is None else None
     read_slot = slot if tail_read_slots is None else tail_read_slots[req]
     # The pool window of every token: positions base + i, i < kpool.
     base = (positions // kp) * kp
@@ -151,6 +160,17 @@ def indexer_write(pooled,
     # The request's last `ring` positions go to its tail (entry pos % ring).
     end = seq_lens[req]
     in_tail = valid & (positions >= end - ring)
+    if tail_window is not None:
+        write, ok = tail_window
+        R = write.shape[0]
+        rings = tail[tail_read_slots].at[jnp.where(in_tail, req, R),
+                                         positions % ring].set(kg.astype(
+                                             tail.dtype),
+                                                               mode="drop")
+        for t in range(write.shape[1]):
+            dst = jnp.where(ok[:, t], write[:, t], tail.shape[0])
+            tail = tail.at[dst].set(rings, mode="drop")
+        return pooled, tail
     tail_slot = jnp.where(in_tail, slot, tail.shape[0])
     tail = tail.at[tail_slot, positions % ring].set(kg.astype(tail.dtype),
                                                     mode="drop")
@@ -511,7 +531,8 @@ def run_sparse_mla_step(latent,
                         index_topk: int,
                         scale: float,
                         kvr: int,
-                        align_block_size: Optional[int] = None):
+                        align_block_size: Optional[int] = None,
+                        spec_group: int = 1):
     """One MLA layer's cache writes and sparse attention under the mesh.
 
     Requests are sharded on ATTN_DATA: with data-parallel attention the
@@ -523,7 +544,8 @@ def run_sparse_mla_step(latent,
 
     Prefix caching ("align" mode): align_block_size = the mamba block size and
     tail_slots the tail group's block tables; the tail slots then come from
-    `align_state_slots`.
+    `align_state_slots`, or with speculative decoding (spec_group =
+    num_spec + 1) from `spec_slots` per position.
 
     Returns (latent, pooled, tail, o_lat [T, H, kvr]).
     """
@@ -538,8 +560,15 @@ def run_sparse_mla_step(latent,
         # over them by query instead of repeating it
         split = n_head_shards > 1 and positions.shape[0] % n_head_shards == 0
         shard = (H, n_head_shards) if split else None
-        tail_read = None
-        if align_block_size is not None:
+        tail_read = window = None
+        if align_block_size is not None and spec_group > 1:
+            bt = jnp.clip(tail_slots.reshape(seq_lens.shape[0], -1), 0,
+                          tail.shape[0] - 1)
+            tail_read, _, ok, write = spec_slots(positions, query_start_loc,
+                                                 bt, distribution, spec_group,
+                                                 align_block_size)
+            window = (write, ok)
+        elif align_block_size is not None:
             tail_read, tail_slots = align_state_slots(tail_slots,
                                                       query_start_loc,
                                                       seq_lens,
@@ -549,7 +578,8 @@ def run_sparse_mla_step(latent,
                                query_start_loc, distribution)
         pooled, tail = indexer_write(pooled, tail, k, gate, ape, positions,
                                      block_tables, seq_lens, query_start_loc,
-                                     distribution, tail_slots, tail_read)
+                                     distribution, tail_slots, tail_read,
+                                     window)
         o_lat = sparse_nope_mla(q_lat,
                                 qi,
                                 wts,

@@ -546,3 +546,143 @@ def test_prefix_caching_align_mode(tp):
         assert _rel(s, ref_rec[0]) < 1e-4, (r, n)
         if tp == 1:  # (the conv state's channels are per-shard for tp > 1)
             assert _rel(c, ref_conv[0]) < 1e-5, (r, n)
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_prefix_caching_with_spec_decode(tp):
+    """Prefix caching ("align" mode, block size 8) with speculative decoding
+    (3 drafts): the per-position states live in block-table columns
+    (`group_slot`). Request A prefills 0-16 and 16-21, then runs verify
+    windows with rejected drafts (junk inputs) across the 24 and 32 block
+    boundaries; request B starts from A's cached block 1 (16 tokens) and
+    runs next to A. Accepted outputs equal one plain run over the accepted
+    tokens, every block whose last position was accepted holds the state
+    after exactly that many tokens, and the shared block is never
+    overwritten."""
+    if len(jax.devices()) < tp:
+        pytest.skip(f"needs {tp} devices")
+    rng = np.random.default_rng(13)
+    C, bs, group = H * D_HEAD, 8, 4
+    n = 44
+    stream = {
+        "w": (0.5 * rng.standard_normal((3 * C, 1, KS))).astype(np.float32)
+    }
+    for r in range(2):
+        stream[r] = dict(
+            qkv=rng.standard_normal((n + 12, 3 * C)).astype(np.float32),
+            g=(-5.0 /
+               (1 + np.exp(-rng.standard_normal((n + 12, H, D_HEAD))))).astype(
+                   np.float32),
+            beta=(1 / (1 + np.exp(-rng.standard_normal((n + 12, H))))).astype(
+                np.float32))
+    for key in ("qkv", "g", "beta"):  # B's prompt starts with A's 16 tokens
+        stream[1][key][:16] = stream[0][key][:16]
+    junk = list(range(n, n + 12))
+    # A's columns; B: null, A's block 1 (cached), then its own
+    block_tables = np.array([[3, 7, 2, 9, 4, 11, 5, 13, 15, 17, 0, 0],
+                             [0, 7, 20, 21, 22, 23, 24, 25, 26, 27, 0, 0]],
+                            np.int32)
+    steps = [
+        [(0, 0, list(range(16)))],
+        [(0, 16, list(range(16, 21)))],
+        # A: x21, x22 + 2 rejected; B: prefill from the hit
+        [(0, 21, [21, 22, junk[0], junk[1]]), (1, 16, list(range(16, 24)))],
+        # A crosses 24: 23, 24, 25 accepted, the last draft rejected
+        [(0, 23, [23, 24, 25, junk[2]]), (1, 24, [24, 25, 26, 27])],
+        [(0, 26, [26, 27, 28, 29]), (1, 28, [28, junk[3], junk[4], junk[5]])],
+        # A crosses 32 with every draft rejected but the first token
+        [(0, 30, [30, 31, junk[6], junk[7]]), (1, 29, [29, 30, 31, 32])],
+        [(0, 32, [32, 33, 34, 35]), (1, 33, [33, 34, 35, 36])],
+    ]
+    keep = [
+        None, None, {
+            0: 2,
+            1: 8
+        }, {
+            0: 3,
+            1: 4
+        }, {
+            0: 4,
+            1: 1
+        }, {
+            0: 2,
+            1: 4
+        }, None
+    ]
+    devs = np.array(jax.devices()[:tp]).reshape(1, 1, 1, 1, tp, 1, 1)
+    mesh = Mesh(devs, MESH_AXIS_NAMES)
+    conv = jnp.asarray(rng.standard_normal((32, KS - 1, 3 * C)), jnp.float32)
+    rec = jnp.asarray(rng.standard_normal((32, H, D_HEAD, D_HEAD)),
+                      jnp.float32)
+    (cq, ck, cv) = (stream["w"][j * C:(j + 1) * C, 0].reshape(H, D_HEAD, KS)
+                    for j in range(3))
+    acc = {0: [], 1: []}
+    shared = None
+    for step, k in zip(steps, keep):
+        T = sum(len(t) for _, _, t in step)
+        pad, max_reqs = 3, 4
+        cat = lambda key, shape: np.concatenate(  # noqa: E731
+            [stream[r][key][t]
+             for r, _, t in step] + [np.zeros((pad, ) + shape, np.float32)])
+        qkv, g, beta = cat("qkv",
+                           (3 * C, )), cat("g",
+                                           (H, D_HEAD)), cat("beta", (H, ))
+        q, kk, v = (qkv[:, j * C:(j + 1) * C].reshape(T + pad, H, D_HEAD)
+                    for j in range(3))
+        pos = np.concatenate([p0 + np.arange(len(t)) for _, p0, t in step] +
+                             [np.zeros(pad, int)]).astype(np.int32)
+        qsl = np.full(max_reqs + 1, T, np.int32)
+        qsl[:len(step) + 1] = np.concatenate([[0],
+                                              np.cumsum(
+                                                  [len(t) for *_, t in step])])
+        sl = np.zeros(max_reqs, np.int32)
+        bt = np.zeros((max_reqs, block_tables.shape[1]), np.int32)
+        for i, (r, p0, t) in enumerate(step):
+            sl[i], bt[i] = p0 + len(t), block_tables[r]
+        dist = np.array([0, len(step), len(step)], np.int32)
+        with mesh:
+            (conv, rec), core = jax.jit(
+                K.run_jax_kda_attention,
+                static_argnames=("mesh", "chunk_size", "align_block_size",
+                                 "spec_group"))(
+                                     *map(jnp.asarray, (q, kk, v, g, beta)),
+                                     conv,
+                                     rec,
+                                     *map(jnp.asarray, (cq, ck, cv)),
+                                     None,
+                                     *map(jnp.asarray, (qsl, dist, sl)),
+                                     mesh=mesh,
+                                     chunk_size=8,
+                                     positions=jnp.asarray(pos),
+                                     spec_group=group,
+                                     block_tables=jnp.asarray(bt.reshape(-1)),
+                                     align_block_size=bs)
+        t0 = 0
+        for r, p0, t in step:
+            m = len(t) if k is None else k[r]
+            acc[r].append(np.asarray(core[t0:t0 + m]))
+            t0 += len(t)
+        if shared is None:  # A's block 1 after the first step: the cache
+            shared = np.asarray(rec[7]), np.asarray(conv[7])
+        np.testing.assert_array_equal(np.asarray(rec[7]), shared[0])
+        np.testing.assert_array_equal(np.asarray(conv[7]), shared[1])
+
+    def reference(r, total):
+        b = _batch(np.random.default_rng(0), [total], [False], 2, 3, 0)
+        b.update(qkv=stream[r]["qkv"][:total],
+                 g=stream[r]["g"][:total],
+                 beta=stream[r]["beta"][:total],
+                 conv_w=stream["w"])
+        return _reference(b)
+
+    for r, start, total in ((0, 0, 36), (1, 16, 37)):
+        out = np.concatenate(acc[r])
+        assert out.shape[0] == total - start, r
+        assert _rel(out, reference(r, total)[0][start:]) < 1e-4, r
+    for r, blocks in ((0, (1, 2, 3)), (1, (2, 3))):
+        for j in blocks:  # block j: the state after (j + 1) * 8 tokens
+            _, ref_conv, ref_rec = reference(r, (j + 1) * bs)
+            slot = block_tables[r][j]
+            assert _rel(np.asarray(rec[slot]), ref_rec[0]) < 1e-4, (r, j)
+            if tp == 1:
+                assert _rel(np.asarray(conv[slot]), ref_conv[0]) < 1e-5, (r, j)

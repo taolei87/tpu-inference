@@ -45,6 +45,7 @@ from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.sparse_mla_indexer import run_sparse_mla_step
 from tpu_inference.layers.jax import JaxModule, mhc
 from tpu_inference.layers.jax.attention.kda import (KimiDeltaAttention,
+                                                    _spec_group,
                                                     align_block_size)
 from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
@@ -327,6 +328,7 @@ class Glm5NextMLA(JaxModule):
         self.num_heads, self.qk, self.dv, self.kvr = H, qk, dv, kvr
         self.scale = qk**-0.5
         self.align_block_size = align_block_size()
+        self.spec_group = _spec_group()
         self.mesh = mesh
         heads = ShardingAxisName.ATTN_HEAD
 
@@ -427,7 +429,8 @@ class Glm5NextMLA(JaxModule):
             index_topk=self.index_topk,
             scale=self.scale,
             kvr=self.kvr,
-            align_block_size=self.align_block_size)
+            align_block_size=self.align_block_size,
+            spec_group=self.spec_group)
         return ((latent, pooled), (tail, )), self.output(o_lat)
 
 

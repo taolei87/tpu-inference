@@ -183,6 +183,20 @@ def _disable_uniproc_startup_thread_cap() -> None:
                 "(vllm#58946) on TPU.")
 
 
+def _spec_prefix_caching_model(vllm_config) -> bool:
+    """Models whose state layers support prefix caching together with
+    speculative decoding: GLM-5.3-Flash with MTP drafts, when
+    num_speculative_tokens + 1 is a power of two (it must divide the block
+    size: kda_attention.group_slot)."""
+    spec = vllm_config.speculative_config
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    archs = getattr(hf_config, "architectures", None) or []
+    if not any(a.startswith("Glm5Next") for a in archs):
+        return False
+    group = getattr(spec, "num_speculative_tokens", 0) + 1
+    return getattr(spec, "method", None) == "mtp" and group & (group - 1) == 0
+
+
 class TpuPlatform(Platform):
     _enum = PlatformEnum.TPU
     device_name: str = "tpu"
@@ -397,7 +411,8 @@ class TpuPlatform(Platform):
         # speculative decoding because verify windows need consecutive state slots.
         if (cache_config and getattr(cache_config, "mamba_cache_mode", "none")
                 == "align"):
-            if vllm_config.speculative_config is not None:
+            if (vllm_config.speculative_config is not None
+                    and not _spec_prefix_caching_model(vllm_config)):
                 logger.warning(
                     "[tpu_platform] Disabling prefix caching: hybrid "
                     "(mamba/linear-attention) models do not support cached "
@@ -471,6 +486,18 @@ class TpuPlatform(Platform):
                             min_page_size,
                         )
                         cache_config.block_size = min_page_size  # type: ignore[assignment]
+
+        if (cache_config and getattr(cache_config, "mamba_cache_mode", "none")
+                == "align" and vllm_config.speculative_config is not None):
+            # GLM-5.3-Flash keeps per-position states in block-table columns
+            # (kda_attention.group_slot): the block size must be a multiple
+            # of num_speculative_tokens + 1.
+            group = (vllm_config.speculative_config.num_speculative_tokens + 1)
+            if cache_config.block_size % group:
+                raise ValueError(
+                    f"Prefix caching with speculative decoding needs the "
+                    f"block size ({cache_config.block_size}) to be a multiple "
+                    f"of num_speculative_tokens + 1 ({group}).")
 
         check_attention_backend_config(vllm_config)
 

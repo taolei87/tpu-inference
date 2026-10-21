@@ -13,7 +13,7 @@
 # limitations under the License.
 """Implements the Eagle3 proposer for speculative decoding on JAX/TPU."""
 from dataclasses import replace
-from typing import Any
+from typing import Any, Optional
 
 import jax
 import jax.numpy as jnp
@@ -338,6 +338,19 @@ class Eagle3Proposer:
                                     block_tables,
                                     sharding=PartitionSpec(
                                         ShardingAxisName.ATTN_DATA))
+        tail_group = self._draft_state_group_id(draft_kv_cache_group_id)
+        if tail_group is not None:
+            # Prefix caching ("align" mode): a draft layer with mamba-style
+            # state (GLM-5.3-Flash's MTP indexer tail) takes its slots from
+            # its own group's block tables; the draft's one metadata carries
+            # them in mamba_state_indices (unused in align mode).
+            tail_tables = device_array(
+                self.mesh,
+                self.runner.input_batch.block_table[tail_group].get_cpu_tensor(
+                ).reshape(-1),
+                sharding=PartitionSpec(ShardingAxisName.ATTN_DATA))
+            attn_metadata = replace(attn_metadata,
+                                    mamba_state_indices=tail_tables)
         num_reqs = num_reqs_dp
         return self._prepare_inputs(
             state_leaves=self.state_leaves,
@@ -363,6 +376,21 @@ class Eagle3Proposer:
                 if names[0] in group.layer_names:
                     return i
         return len(groups) - 1
+
+    def _draft_state_group_id(self, draft_group: int) -> Optional[int]:
+        """Under prefix caching (align mode), the KV cache group of the draft
+        model's second named layer if it isn't the draft group (a state
+        layer), else None."""
+        if self.runner.cache_config.mamba_cache_mode != "align":
+            return None
+        names = getattr(self.model, "draft_layer_names", None)
+        if not names or len(names) < 2:
+            return None
+        groups = self.runner.kv_cache_config.kv_cache_groups
+        for i, group in enumerate(groups):
+            if names[1] in group.layer_names and i != draft_group:
+                return i
+        return None
 
     @jax.jit(static_argnums=(0, ))
     def _prepare_inputs(

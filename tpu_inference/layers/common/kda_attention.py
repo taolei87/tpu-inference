@@ -192,6 +192,29 @@ def ragged_kda_chunked(q,
     recurrent_state [num_slots, H, dk, dv]. Returns (new recurrent_state,
     out [T, H, dv] f32).
     """
+    read = state_indices if read_indices is None else read_indices
+    final, out = _chunked_final(q,
+                                k,
+                                v,
+                                g,
+                                beta,
+                                recurrent_state,
+                                query_start_loc,
+                                read,
+                                distribution,
+                                has_initial_state,
+                                chunk_size=chunk_size)
+    valid = jnp.arange(state_indices.shape[0]) < distribution[2]
+    cur = recurrent_state[state_indices]
+    new = jnp.where(valid[:, None, None, None],
+                    final.astype(recurrent_state.dtype), cur)
+    return recurrent_state.at[state_indices].set(new), out
+
+
+def _chunked_final(q, k, v, g, beta, recurrent_state, query_start_loc, read,
+                   distribution, has_initial_state, *, chunk_size: int):
+    """The chunked pass from the states in slots `read`: (final state per
+    request [max_reqs, H, dk, dv] f32, out [T, H, dv] f32). Writes nothing."""
     dk = k.shape[-1]
     q = _l2norm(q) * (dk**-0.5)
     k = _l2norm(k)
@@ -212,7 +235,6 @@ def ragged_kda_chunked(q,
         return jnp.swapaxes(x.reshape((n_chunks, chunk_size) + x.shape[1:]), 1,
                             2)
 
-    read = state_indices if read_indices is None else read_indices
     init = recurrent_state[read].astype(jnp.float32)
     init = jnp.where(has_initial_state[:, None, None, None], init, 0.0)
     start_chunks = new_qsl[:-1] // chunk_size
@@ -233,12 +255,7 @@ def ragged_kda_chunked(q,
     out = jnp.swapaxes(out, 1, 2).reshape(-1, H, dv)[idx]  # [T, H, dv]
 
     last_chunk = new_qsl[1:] // chunk_size - 1
-    final = s_after[jnp.clip(last_chunk, 0, n_chunks - 1)]
-    valid = jnp.arange(state_indices.shape[0]) < distribution[2]
-    cur = recurrent_state[state_indices]
-    new = jnp.where(valid[:, None, None, None],
-                    final.astype(recurrent_state.dtype), cur)
-    return recurrent_state.at[state_indices].set(new), out
+    return s_after[jnp.clip(last_chunk, 0, n_chunks - 1)], out
 
 
 def ragged_kda_decode(q,
@@ -275,33 +292,67 @@ def ragged_kda_decode(q,
 
 
 # ---------------------------------------------------------------------------
-# Speculative decoding. Each request owns `group` = num_spec + 1 consecutive
-# state slots (base = state_indices[r]). The state after the token at
-# position p is kept in slot base + p % group, and a step starts from the
-# state after its first token's predecessor, base + (p_first - 1) % group. A
-# verify window has at most `group` tokens, so after any number of accepted
-# drafts the next step's first position points at the state after the last
-# accepted token: rejected tokens' states are never read and nothing has to
-# be rolled back. group == 1 is the plain one-slot layout.
+# Speculative decoding. The state after the token at position p is kept in
+# its own slot `group_slot(p)`, distinct for any `group` = num_spec + 1
+# consecutive positions, and a step starts from the state after its first
+# token's predecessor. A verify window has at most `group` tokens, so after
+# any number of accepted drafts the next step's first position points at the
+# state after the last accepted token: rejected tokens' states are never read
+# and nothing has to be rolled back. group == 1 is the plain one-slot layout.
+#
+# Per-request slots (state_indices [R]): each request owns `group`
+# consecutive slots from base = state_indices[r]; position p uses
+# base + p % group.
+#
+# Prefix caching (align mode; state_indices = the block tables [R, cols]):
+# position p in block j = p // block_size uses column
+# j + (block_size - 1 - p % block_size) % group. A block's last position
+# lands on the block itself (block j holds the state after (j + 1) *
+# block_size tokens, which is what vLLM caches it as); the others use the
+# request's speculative columns j + 1 .. j + num_spec, which vLLM keeps
+# allocated. Needs block_size % group == 0 (else windows that cross a block
+# boundary would reuse a slot).
 
 
-def spec_slots(positions, query_start_loc, state_indices, distribution,
-               group: int):
+def group_slot(state_indices, pos, group: int, block_size=None):
+    """The slot that holds the state after position pos ([R] or [R, n], rows
+    matching state_indices)."""
+    rows = jnp.arange(state_indices.shape[0])
+    if pos.ndim == 2:
+        rows = rows[:, None]
+    if block_size is None:
+        return state_indices[rows] + jnp.mod(pos, group)
+    assert block_size % group == 0, (block_size, group)
+    col = pos // block_size + jnp.mod(
+        block_size - 1 - jnp.mod(pos, block_size), group)
+    return state_indices[rows, jnp.clip(col, 0, state_indices.shape[1] - 1)]
+
+
+def spec_slots(positions,
+               query_start_loc,
+               state_indices,
+               distribution,
+               group: int,
+               block_size=None):
     """(read slots [R], per-request window: token index [R, group] of the
     last <= group tokens of each request, valid mask [R, group], write slots
-    [R, group])."""
+    [R, group]). block_size: prefix caching (state_indices are the block
+    tables [R, cols])."""
     T, R = positions.shape[0], state_indices.shape[0]
     starts, lens = query_start_loc[:-1], jnp.diff(query_start_loc)
     valid = jnp.arange(R) < distribution[2]
     lens = jnp.where(valid, lens, 0)
     first = positions[jnp.clip(starts, 0, T - 1)]
-    read = jnp.where(valid, state_indices + jnp.mod(first - 1, group),
-                     state_indices)
+    slot = functools.partial(group_slot,
+                             state_indices,
+                             group=group,
+                             block_size=block_size)
+    read = jnp.where(valid, slot(first - 1), slot(jnp.full_like(first, -1)))
     tail = jnp.minimum(lens, group)
     t = jnp.arange(group)[None]
     idx = jnp.clip((starts + lens - tail)[:, None] + t, 0, T - 1)
     ok = t < tail[:, None]
-    write = state_indices[:, None] + jnp.mod(positions[idx], group)
+    write = slot(positions[idx])
     return read, idx, ok, write
 
 
@@ -315,34 +366,47 @@ def _decode_step(S, q, k, v, g, beta):
     return S, jnp.einsum("thkv,thk->thv", S, q)
 
 
-def ragged_kda_spec(q, k, v, g, beta, recurrent_state, query_start_loc,
-                    state_indices, distribution, has_initial_state, positions,
-                    *, group: int, chunk_size: int):
+def ragged_kda_spec(q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    recurrent_state,
+                    query_start_loc,
+                    state_indices,
+                    distribution,
+                    has_initial_state,
+                    positions,
+                    *,
+                    group: int,
+                    chunk_size: int,
+                    block_size=None):
     """`ragged_kda` with per-position state checkpoints (see above): the
     chunked pass runs with each request's last <= group tokens made no-ops
     (beta = 0, g = 0), which gives the state before them; those tokens then
-    run recurrently, writing the state after each one."""
+    run recurrently, writing the state after each one. Only the write slots
+    are written (a read slot may be a cached block)."""
     T = q.shape[0]
     read, idx, ok, write = spec_slots(positions, query_start_loc,
-                                      state_indices, distribution, group)
+                                      state_indices, distribution, group,
+                                      block_size)
     in_window = jnp.zeros(T, bool).at[idx].max(ok)
     g0 = jnp.where(in_window[:, None, None], 0.0, g)
     b0 = jnp.where(in_window[:, None], 0.0, beta)
-    state, out = ragged_kda_chunked(q,
-                                    k,
-                                    v,
-                                    g0,
-                                    b0,
-                                    recurrent_state,
-                                    query_start_loc,
-                                    read,
-                                    distribution,
-                                    has_initial_state,
-                                    chunk_size=chunk_size)
+    final, out = _chunked_final(q,
+                                k,
+                                v,
+                                g0,
+                                b0,
+                                recurrent_state,
+                                query_start_loc,
+                                read,
+                                distribution,
+                                has_initial_state,
+                                chunk_size=chunk_size)
     R = min(state_indices.shape[0], T)  # rows that can hold a request
-    S = state[read[:R]].astype(jnp.float32)  # before each request's window
-    return _recurrent_windows(S, state, out, q, k, v, g, beta, idx[:R], ok[:R],
-                              write[:R])
+    return _recurrent_windows(final[:R], recurrent_state, out, q, k, v, g,
+                              beta, idx[:R], ok[:R], write[:R])
 
 
 def _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write):
@@ -364,16 +428,28 @@ def _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write):
     return state, out
 
 
-def ragged_kda_windows(q, k, v, g, beta, recurrent_state, query_start_loc,
-                       state_indices, distribution, has_initial_state,
-                       positions, *, group: int):
+def ragged_kda_windows(q,
+                       k,
+                       v,
+                       g,
+                       beta,
+                       recurrent_state,
+                       query_start_loc,
+                       state_indices,
+                       distribution,
+                       has_initial_state,
+                       positions,
+                       *,
+                       group: int,
+                       block_size=None):
     """A step where every request has at most `group` tokens (a speculative
     verify step): all tokens run recurrently from the read slots, without
     the chunked pass (which pads every request to a whole chunk)."""
     # every valid request has a token: at most T of the max_reqs rows matter
     R = min(state_indices.shape[0], q.shape[0])
     read, idx, ok, write = spec_slots(positions, query_start_loc[:R + 1],
-                                      state_indices[:R], distribution, group)
+                                      state_indices[:R], distribution, group,
+                                      block_size)
     S = recurrent_state[read].astype(jnp.float32)
     S = jnp.where(has_initial_state[:R, None, None, None], S, 0.0)
     out = jnp.zeros(v.shape, jnp.float32)
@@ -381,16 +457,29 @@ def ragged_kda_windows(q, k, v, g, beta, recurrent_state, query_start_loc,
                               ok, write)
 
 
-def ragged_kda_decode_spec(q, k, v, g, beta, recurrent_state, positions,
-                           state_indices, distribution, *, group: int):
+def ragged_kda_decode_spec(q,
+                           k,
+                           v,
+                           g,
+                           beta,
+                           recurrent_state,
+                           positions,
+                           state_indices,
+                           distribution,
+                           *,
+                           group: int,
+                           block_size=None):
     """`ragged_kda_decode` (one token per request) with the slot group: read
     the state of position p - 1, write the state of p."""
     T, dk = q.shape[0], k.shape[-1]
     slots = state_indices[:T]
     valid = jnp.arange(T) < distribution[2]
-    read = jnp.where(valid, slots + jnp.mod(positions - 1, group), slots)
-    write = jnp.where(valid, slots + jnp.mod(positions, group),
-                      recurrent_state.shape[0])
+    slot = functools.partial(group_slot,
+                             slots,
+                             group=group,
+                             block_size=block_size)
+    read = slot(jnp.where(valid, positions - 1, -1))
+    write = jnp.where(valid, slot(positions), recurrent_state.shape[0])
     S, out = _decode_step(recurrent_state[read].astype(jnp.float32),
                           _l2norm(q) * (dk**-0.5), _l2norm(k), v, g, beta)
     return recurrent_state.at[write].set(S.astype(recurrent_state.dtype),
@@ -411,14 +500,16 @@ def ragged_kda(q,
                chunk_size: int = 64,
                positions=None,
                spec_group: int = 1,
-               read_indices=None):
+               read_indices=None,
+               block_size=None):
     """Dispatches to the decode-only path when every request has one token.
-    spec_group > 1: the speculative-decoding slot groups (positions needed).
-    read_indices: the slots to read from (prefix caching), not with
-    spec_group > 1."""
+    spec_group > 1: the speculative-decoding slot groups (positions needed;
+    with block_size, state_indices are the block tables [R, cols]).
+    read_indices: the slots to read from (prefix caching without
+    speculative decoding)."""
     T, max_reqs = q.shape[0], state_indices.shape[0]
     if spec_group > 1:
-        assert read_indices is None, "prefix caching with speculative decoding"
+        assert read_indices is None
         args = (q, k, v, g, beta, recurrent_state, query_start_loc,
                 state_indices, distribution, has_initial_state, positions)
         lens = jnp.where(
@@ -429,10 +520,12 @@ def ragged_kda(q,
             # a verify step (every request <= spec_group tokens) needs no
             # chunked pass
             return lax.cond(
-                jnp.max(lens) <= spec_group,
-                lambda: ragged_kda_windows(*args, group=spec_group),
-                lambda: ragged_kda_spec(
-                    *args, group=spec_group, chunk_size=chunk_size))
+                jnp.max(lens) <= spec_group, lambda: ragged_kda_windows(
+                    *args, group=spec_group, block_size=block_size),
+                lambda: ragged_kda_spec(*args,
+                                        group=spec_group,
+                                        chunk_size=chunk_size,
+                                        block_size=block_size))
 
         R = min(T, max_reqs)
 
@@ -446,7 +539,8 @@ def ragged_kda(q,
                                                 positions[:R],
                                                 state_indices,
                                                 distribution,
-                                                group=spec_group)
+                                                group=spec_group,
+                                                block_size=block_size)
             return state, jnp.pad(out, ((0, T - R), (0, 0), (0, 0)))
 
         return lax.cond(distribution[0] == distribution[2], decode_spec,
@@ -490,7 +584,8 @@ def kda_conv_and_core(qkv,
                       chunk_size: int = 64,
                       positions=None,
                       spec_group: int = 1,
-                      read_indices=None):
+                      read_indices=None,
+                      block_size=None):
     """Single-device KDA layer core: causal conv + SiLU + ragged KDA.
 
     qkv [T, 3C] (the q | k | v projections before the conv, C = num_heads *
@@ -498,6 +593,8 @@ def kda_conv_and_core(qkv,
     [num_slots, K-1, 3C]; recurrent_state [num_slots, H, d, d];
     conv_weight [3C, 1, K]. Returns ((new conv_state, new recurrent_state),
     core [T, H, d] f32 (before the gated output norm)).
+    With spec_group > 1 and block_size (prefix caching), state_indices are
+    the block tables [R, cols].
     """
     has_init = has_initial_state_from_lens(query_start_loc, seq_lens)
     # The conv state holds raw inputs in its own (model) dtype.
@@ -508,24 +605,35 @@ def kda_conv_and_core(qkv,
         # slot first (the read slot itself, or a fresh block of its own).
         conv_state = conv_state.at[state_indices].set(conv_state[read_indices])
     if spec_group > 1:
-        conv_slots, idx, ok, write = spec_slots(positions, query_start_loc,
-                                                state_indices, distribution,
-                                                spec_group)
-        prev = jnp.where(has_init[:, None, None], conv_state[conv_slots], 0)
-    x, new_conv = ragged_conv1d(qkv,
-                                conv_state,
-                                conv_weight,
-                                None,
-                                query_start_loc,
-                                conv_slots,
-                                distribution,
-                                has_init,
-                                kernel_size=kernel_size)
-    if spec_group > 1:
+        # The conv runs on a copy of the read states: only the checkpoints
+        # are written (a read slot may be a cached block).
+        read, idx, ok, write = spec_slots(positions, query_start_loc,
+                                          state_indices, distribution,
+                                          spec_group, block_size)
+        prev = jnp.where(has_init[:, None, None], conv_state[read], 0)
+        x, _ = ragged_conv1d(qkv,
+                             prev,
+                             conv_weight,
+                             None,
+                             query_start_loc,
+                             jnp.arange(prev.shape[0], dtype=jnp.int32),
+                             distribution,
+                             has_init,
+                             kernel_size=kernel_size)
         R = min(state_indices.shape[0], qkv.shape[0])
-        new_conv = _write_conv_checkpoints(new_conv, qkv, prev[:R],
+        new_conv = _write_conv_checkpoints(conv_state, qkv, prev[:R],
                                            query_start_loc[:R + 1], idx[:R],
                                            ok[:R], write[:R])
+    else:
+        x, new_conv = ragged_conv1d(qkv,
+                                    conv_state,
+                                    conv_weight,
+                                    None,
+                                    query_start_loc,
+                                    conv_slots,
+                                    distribution,
+                                    has_init,
+                                    kernel_size=kernel_size)
     x = jax.nn.silu(x.astype(jnp.float32))
     T, C = x.shape[0], num_heads * head_dim
     q, k, v = (x[:, i * C:(i + 1) * C].reshape(T, num_heads, head_dim)
@@ -543,7 +651,8 @@ def kda_conv_and_core(qkv,
                                  chunk_size=chunk_size,
                                  positions=positions,
                                  spec_group=spec_group,
-                                 read_indices=read_indices)
+                                 read_indices=read_indices,
+                                 block_size=block_size)
     return (new_conv, new_state), core
 
 
@@ -580,7 +689,12 @@ def _kda_heads_local(q, k, v, g, beta, conv_state, recurrent_state, conv_q,
     T, H = q.shape[0], q.shape[1]
     kw = {} if spec_group == 1 else dict(positions=positions,
                                          spec_group=spec_group)
-    if align_block_size is not None:
+    if align_block_size is not None and spec_group > 1:
+        # the slots come from the block tables per position (`group_slot`)
+        state_indices = jnp.clip(state_indices.reshape(seq_lens.shape[0], -1),
+                                 0, recurrent_state.shape[0] - 1)
+        kw["block_size"] = align_block_size
+    elif align_block_size is not None:
         kw["read_indices"], state_indices = align_state_slots(
             state_indices, query_start_loc, seq_lens, align_block_size,
             recurrent_state.shape[0])
@@ -664,7 +778,6 @@ def run_jax_kda_attention(
                               spec_group=spec_group,
                               align_block_size=align_block_size)
     if align_block_size is not None:
-        assert spec_group == 1, "prefix caching with speculative decoding"
         state_indices = block_tables
     heads = P(D, H, None)
     conv_w = P(H, None, None)

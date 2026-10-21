@@ -809,3 +809,113 @@ def test_align_block_size_is_the_attention_block_size():
     cfg.cache_config.mamba_cache_mode = "none"
     with set_current_vllm_config(cfg):
         assert align_block_size() is None
+
+
+def test_prefix_caching_with_spec_decode(tmp_path, monkeypatch):
+    """Prefix caching ("align" mode, block 16) with speculative decoding
+    (3 drafts; index_topk 16, so the indexer selects): the KDA and tail
+    states live in block-table columns per position. Request 0 prefills 22
+    tokens, then runs verify windows with rejected junk drafts across the
+    32 boundary; request 1 shares its first 16 tokens and starts from
+    request 0's MLA page 0 and state block 0. Every accepted token matches
+    the reference over the true tokens."""
+    from tpu_inference.layers.jax.attention import kda as kda_layer
+    from tpu_inference.models.jax import glm5_next as glm_module
+    for mod in (kda_layer, glm_module):
+        monkeypatch.setattr(mod, "align_block_size", lambda: PAGE)
+        monkeypatch.setattr(mod, "_spec_group", lambda: 4)
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=31, index_topk=16)
+    vllm_config, model, mesh = _build(d)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(15)
+    ids = {0: rng.integers(0, text.vocab_size, 40)}
+    ids[1] = np.concatenate(
+        [ids[0][:16], rng.integers(0, text.vocab_size, 24)])
+    ref = _reference(d, ids, sparse="always")
+    caches = _Caches(text, num_spec=3)
+    lay, n_slots = caches.lay, 24
+    state_names = {KV.layer_name(i) for i in lay.kda_layers}
+    state_names |= {KV.indexer_tail_name(i) for i in lay.mla_layers}
+    for name in state_names:
+        idx = caches.index[name]
+        caches.kv_caches[idx] = tuple(
+            jnp.asarray(rng.standard_normal((n_slots, ) +
+                                            x.shape[1:]), x.dtype)
+            for x in caches.kv_caches[idx])
+    pages = caches.block_tables.reshape(MAX_REQS, PAGES_PER_SEQ).copy()
+    pages[1, 0] = pages[0, 0]
+    states = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+    states[0, :7] = [5, 9, 2, 14, 3, 8, 12]
+    states[1, :7] = [5, 16, 17, 18, 19, 20, 21]
+    junk = rng.integers(0, text.vocab_size, 12)
+    names = tuple(caches.index.items())
+
+    @jax.jit
+    def fwd(model, kv, tok, mds):
+        kv, h, _, _ = model(kv, tok, mds, None, None, names)
+        return kv, h, model.compute_logits(h)
+
+    def run(step):
+        """step: [(request, first position, tokens)], decodes first."""
+        md, T = caches.metadata([(r, p0, len(t)) for r, p0, t in step])
+        page_bt = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+        state_bt = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+        for i, (r, _, _) in enumerate(step):
+            page_bt[i], state_bt[i] = pages[r], states[r]
+        page_md = dataclasses.replace(md,
+                                      block_tables=jnp.asarray(
+                                          page_bt.reshape(-1)),
+                                      mamba_state_indices=None)
+        state_md = dataclasses.replace(page_md,
+                                       block_tables=jnp.asarray(
+                                           state_bt.reshape(-1)))
+        mds = {
+            n: state_md if n in state_names else page_md
+            for n in caches.index
+        }
+        tokens = np.concatenate([t for _, _, t in step])
+        tokens = np.pad(tokens, (0, T - len(tokens)))
+        with jax.set_mesh(mesh):
+            caches.kv_caches, h, logits = fwd(model, caches.kv_caches,
+                                              jnp.asarray(tokens), mds)
+        out, t0 = {}, 0
+        for r, _, t in step:
+            out[r] = (np.asarray(h[t0:t0 + len(t)]),
+                      np.asarray(logits[t0:t0 + len(t)]))
+            t0 += len(t)
+        return out
+
+    def win(r, p0, n_true, n_junk, j):
+        return (r, p0,
+                np.concatenate([ids[r][p0:p0 + n_true], junk[j:j + n_junk]]))
+
+    steps = [
+        ([win(0, 0, 16, 0, 0)], None),
+        ([win(0, 16, 6, 0, 0), win(1, 16, 12, 0, 0)], None),
+        # r0: 22, 23 + 2 junk drafts; r1: 28-31 (crosses into block 1 end)
+        ([win(0, 22, 2, 2, 0), win(1, 28, 4, 0, 0)], {
+            0: 2
+        }),
+        ([win(0, 24, 4, 0, 0), win(1, 32, 1, 3, 2)], {
+            1: 1
+        }),
+        # r0 crosses 32 with its last draft rejected
+        ([win(0, 28, 3, 1, 5), win(1, 33, 4, 0, 0)], {
+            0: 3
+        }),
+        ([win(0, 31, 4, 0, 0), win(1, 37, 3, 0, 0)], None),
+        ([win(0, 35, 4, 0, 0)], None),
+    ]
+    got = {0: ([], []), 1: ([], [])}
+    for step, keep in steps:
+        out = run(step)
+        for r, _, t in step:
+            m = len(t) if not keep or r not in keep else keep[r]
+            got[r][0].append(out[r][0][:m])
+            got[r][1].append(out[r][1][:m])
+    for r, start, total in ((0, 0, 39), (1, 16, 40)):
+        h, logits = (np.concatenate(x) for x in got[r])
+        assert h.shape[0] == total - start, r
+        assert _rel(h, ref[r][0][start:total]) < 1e-4, r
+        assert _rel(logits, ref[r][1][start:total]) < 1e-4, r

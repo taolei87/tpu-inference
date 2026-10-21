@@ -25,6 +25,7 @@ mHC. The MLA has its own latent, pooled-key and indexer-tail caches, named
 like a decoder layer at index num_hidden_layers.
 """
 
+import dataclasses
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import jax
@@ -166,6 +167,14 @@ class Glm5NextMTPModel(JaxModule, LoadableWithIterator):
         idx, tidx = index[name], index[tail_name]
         md = (_layer_metadata(attention_metadata, name),
               _layer_metadata(attention_metadata, tail_name))
+        if (self.model.mtp.self_attn.align_block_size is not None
+                and md[1] is md[0]):
+            # Prefix caching: the proposer passes one metadata, with the
+            # tail group's block tables in mamba_state_indices
+            # (Eagle3Proposer.prepare_inputs).
+            md = (md[0],
+                  dataclasses.replace(md[0],
+                                      block_tables=md[0].mamba_state_indices))
         kv_caches = list(kv_caches)
         (kv_caches[idx], kv_caches[tidx]), h = self.model.mtp(
             (kv_caches[idx], kv_caches[tidx]),
