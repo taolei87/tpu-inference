@@ -393,3 +393,20 @@ class TestMultiGroupBlockTable:
             np.testing.assert_array_equal(np.array(table.get_device_tensor()),
                                           0)
             np.testing.assert_array_equal(table.num_blocks_per_row, 0)
+
+
+def test_block_table_width_holds_speculative_blocks():
+    """Under prefix caching with speculative decoding a mamba group's rows
+    hold cdiv(max_model_len, block_size) + num_speculative_tokens blocks
+    (vLLM's MambaSpec.max_num_blocks_per_req); without prefix caching the
+    mamba block size is max_model_len and a row is the slot group."""
+    from tpu_inference.runner.block_table import \
+        MultiGroupBlockTable as RealMultiGroupBlockTable
+    t = RealMultiGroupBlockTable(max_num_reqs=2,
+                                 max_model_len=4100,
+                                 max_num_batched_tokens=64,
+                                 pin_memory=False,
+                                 block_sizes=[1024, 4100],
+                                 num_speculative_tokens=3)
+    assert [b.max_num_blocks_per_req for b in t.block_tables] == [8, 4]
+    t.append_row([list(range(1, 9)), [1, 2, 3, 4]], 0)
