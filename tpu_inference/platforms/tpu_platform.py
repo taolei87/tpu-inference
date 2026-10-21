@@ -183,6 +183,23 @@ def _disable_uniproc_startup_thread_cap() -> None:
                 "(vllm#58946) on TPU.")
 
 
+def _prompt_logprobs_unsupported(vllm_config) -> str | None:
+    """Why the TPU model runner can't serve prompt_logprobs for this config
+    (it raises inside the engine step), or None."""
+    if vllm_config.speculative_config is not None:
+        return "speculative decoding"
+    model_config = vllm_config.model_config
+    if model_config is not None and getattr(model_config,
+                                            "is_multimodal_model", False):
+        mm = getattr(model_config, "multimodal_config", None)
+        limits = getattr(mm, "limit_per_prompt", None)
+        # (the runner turns the vision path off when every limit is 0)
+        if not (limits
+                and all(getattr(v, "count", v) == 0 for v in limits.values())):
+            return "multimodal models"
+    return None
+
+
 def _spec_prefix_caching_model(vllm_config) -> bool:
     """Models whose state layers support prefix caching together with
     speculative decoding: GLM-5.3-Flash with MTP drafts, when
@@ -383,6 +400,8 @@ class TpuPlatform(Platform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
 
         cls._resolve_multiprocess_dp(vllm_config)
+        cls._prompt_logprobs_unsupported = _prompt_logprobs_unsupported(
+            vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             assert not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING, (
@@ -645,6 +664,12 @@ class TpuPlatform(Platform):
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")
+            reason = getattr(cls, "_prompt_logprobs_unsupported", None)
+            if params.prompt_logprobs is not None and reason:
+                # Rejected here: the model runner can't compute them and
+                # would fail the whole engine step.
+                raise ValueError(
+                    f"prompt_logprobs is not supported on TPU with {reason}.")
 
     @classmethod
     def is_kv_cache_dtype_supported(cls, kv_cache_dtype: str,

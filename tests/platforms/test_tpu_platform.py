@@ -177,8 +177,48 @@ class TestTpuPlatform:
         from vllm.sampling_params import SamplingParams, SamplingType
         params = MagicMock(spec=SamplingParams)
         params.sampling_type = SamplingType.GREEDY
+        params.prompt_logprobs = None
         # Should execute cleanly without raising
         TpuPlatform.validate_request(MagicMock(), params)
+
+    @pytest.mark.parametrize("reason", ["speculative decoding", None])
+    def test_validate_request_prompt_logprobs(self, reason, monkeypatch):
+        """prompt_logprobs are rejected up front where the model runner can't
+        compute them (it would fail the whole engine step)."""
+        from vllm.sampling_params import SamplingParams, SamplingType
+        monkeypatch.setattr(TpuPlatform,
+                            "_prompt_logprobs_unsupported",
+                            reason,
+                            raising=False)
+        params = MagicMock(spec=SamplingParams)
+        params.sampling_type = SamplingType.GREEDY
+        params.prompt_logprobs = 1
+        if reason:
+            with pytest.raises(ValueError, match="prompt_logprobs"):
+                TpuPlatform.validate_request(MagicMock(), params)
+        else:
+            TpuPlatform.validate_request(MagicMock(), params)
+
+    def test_prompt_logprobs_unsupported_reasons(self):
+        from types import SimpleNamespace
+
+        from tpu_inference.platforms.tpu_platform import \
+            _prompt_logprobs_unsupported
+        mm = SimpleNamespace(
+            is_multimodal_model=True,
+            multimodal_config=SimpleNamespace(limit_per_prompt={"image": 2}))
+        text_only = SimpleNamespace(is_multimodal_model=True,
+                                    multimodal_config=SimpleNamespace(
+                                        limit_per_prompt={
+                                            "image": SimpleNamespace(count=0),
+                                            "video": SimpleNamespace(count=0)
+                                        }))
+        cfg = lambda m, spec=None: SimpleNamespace(  # noqa: E731
+            model_config=m, speculative_config=spec)
+        assert _prompt_logprobs_unsupported(cfg(
+            text_only, object())) == "speculative decoding"
+        assert _prompt_logprobs_unsupported(cfg(mm)) == "multimodal models"
+        assert _prompt_logprobs_unsupported(cfg(text_only)) is None
 
     def test_get_attn_backend_cls_mla(self):
         with patch.dict('sys.modules',
