@@ -794,3 +794,18 @@ def test_prefix_caching_align_mode(tmp_path, monkeypatch):
         assert h.shape[0] == len(ids[rid]) - start, rid
         assert _rel(h, ref[rid][0][start:]) < 1e-4, rid
         assert _rel(logits, ref[rid][1][start:]) < 1e-4, rid
+
+
+def test_align_block_size_is_the_attention_block_size():
+    """Under the Ray executor the platform aligns mamba_block_size only after
+    the model is built, so the layers must use block_size."""
+    from tpu_inference.layers.jax.attention.kda import align_block_size
+    cfg = VllmConfig()
+    cfg.cache_config.block_size = 1024
+    cfg.cache_config.mamba_block_size = 16
+    cfg.cache_config.mamba_cache_mode = "align"
+    with set_current_vllm_config(cfg):
+        assert align_block_size() == 1024
+    cfg.cache_config.mamba_cache_mode = "none"
+    with set_current_vllm_config(cfg):
+        assert align_block_size() is None

@@ -56,7 +56,12 @@ def _spec_group() -> int:
 
 def align_block_size() -> Optional[int]:
     """The mamba block size under prefix caching ("align" mode: the state
-    slots come from the block tables), else None."""
+    slots come from the block tables), else None.
+
+    This is the attention block size: the TPU platform sets mamba_block_size
+    to it, but only in update_block_size_for_backend, which the Ray executor
+    runs on the workers after the model is built (mamba_block_size still holds
+    vLLM's default then). block_size is final before the model is built."""
     try:
         from vllm.config import get_current_vllm_config
         cache = get_current_vllm_config().cache_config
@@ -64,7 +69,7 @@ def align_block_size() -> Optional[int]:
         return None
     if getattr(cache, "mamba_cache_mode", "none") != "align":
         return None
-    return cache.mamba_block_size or cache.block_size
+    return cache.block_size
 
 
 def _param(rngs: nnx.Rngs, shape, dtype, sharding, **loader_kwargs):
