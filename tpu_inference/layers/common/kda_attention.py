@@ -42,6 +42,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import PartitionSpec as P
 
+import tpu_inference.envs as envs
 from tpu_inference.kernels.gdn.reference.ragged_gated_delta_rule_chunked import \
     pack_inputs_single_stream
 from tpu_inference.layers.common.ragged_conv1d_jax import ragged_conv1d
@@ -153,6 +154,14 @@ def _kda_chunk_step(S, q, k, v, g, beta, sub: int = 16):
     Returns (S after the chunk, out [H, c, dv]). Padded positions must have
     beta = 0 and g = 0 so they neither update nor decay the state.
     """
+    return _kda_chunk_recur(S, *_kda_chunk_prep(q, k, v, g, beta, sub))
+
+
+def _kda_chunk_prep(q, k, v, g, beta, sub: int = 16):
+    """The part of a chunk that doesn't depend on the state (batchable over
+    chunks): (u, w, attn, q decayed, k decayed to the chunk's end, the
+    chunk's total decay) for `_kda_chunk_recur`. Shapes as in
+    `_kda_chunk_step`."""
     c = q.shape[1]
     gc = jnp.cumsum(g, axis=1)  # [H, c, dk], <= 0, non-increasing
     sub = sub if c % sub == 0 else c
@@ -165,11 +174,17 @@ def _kda_chunk_step(S, q, k, v, g, beta, sub: int = 16):
     u = t @ (v * beta[..., None])  # [H, c, dv]
     w = t @ (k_beta * jnp.exp(gc))  # [H, c, dk]
     attn = _decay_mix(q, k, gc, sub)  # lower triangle incl. the diagonal
-    v_new = u - w @ S
-    out = (q * jnp.exp(gc)) @ S + attn @ v_new
     g_last = gc[:, -1, :]  # [H, dk]
-    S = S * jnp.exp(g_last)[:, :, None] + jnp.swapaxes(
-        k * jnp.exp(g_last[:, None, :] - gc), -1, -2) @ v_new
+    q_dec = q * jnp.exp(gc)
+    k_dec = jnp.swapaxes(k * jnp.exp(g_last[:, None, :] - gc), -1, -2)
+    return u, w, attn, q_dec, k_dec, jnp.exp(g_last)
+
+
+def _kda_chunk_recur(S, u, w, attn, q_dec, k_dec, decay):
+    """The state recurrence of one chunk: (S after it, out [H, c, dv])."""
+    v_new = u - w @ S
+    out = q_dec @ S + attn @ v_new
+    S = S * decay[:, :, None] + k_dec @ v_new
     return S, out
 
 
@@ -243,14 +258,27 @@ def _chunked_final(q, k, v, g, beta, recurrent_state, query_start_loc, read,
     init_per_chunk = jnp.zeros((n_chunks, H, dk, dv), jnp.float32)
     init_per_chunk = init_per_chunk.at[start_chunks].set(init, mode="drop")
 
-    def body(S, xs):
-        qc, kc, vc, gc, bc, rst, s0 = xs
-        S = jnp.where(rst, s0, S)
-        S, out = _kda_chunk_step(S, qc, kc, vc, gc, bc)
-        return S, (out, S)
+    chunks = (to_chunks(pq), to_chunks(pk), to_chunks(pv), to_chunks(pg),
+              to_chunks(pbeta))
+    if envs.KDA_PREP_OUTSIDE_SCAN:
+        prep = jax.vmap(_kda_chunk_prep)(*chunks)
 
-    xs = (to_chunks(pq), to_chunks(pk), to_chunks(pv), to_chunks(pg),
-          to_chunks(pbeta), reset, init_per_chunk)
+        def body(S, xs):
+            rst, s0, *p = xs
+            S = jnp.where(rst, s0, S)
+            S, out = _kda_chunk_recur(S, *p)
+            return S, (out, S)
+
+        xs = (reset, init_per_chunk, *prep)
+    else:
+
+        def body(S, xs):
+            qc, kc, vc, gc, bc, rst, s0 = xs
+            S = jnp.where(rst, s0, S)
+            S, out = _kda_chunk_step(S, qc, kc, vc, gc, bc)
+            return S, (out, S)
+
+        xs = (*chunks, reset, init_per_chunk)
     _, (out, s_after) = lax.scan(body, jnp.zeros((H, dk, dv), jnp.float32), xs)
     out = jnp.swapaxes(out, 1, 2).reshape(-1, H, dv)[idx]  # [T, H, dv]
 

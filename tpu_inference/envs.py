@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     MLA_WHOLE_ROW_GATHER: bool = False
     GLM5_MOE_TOKEN_SPLITS: int = 1
     MLA_SELECT_INTERLEAVE: bool = True
+    KDA_PREP_OUTSIDE_SCAN: bool = True
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -598,6 +599,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ... instead of the i-th contiguous slice of the step.
     "MLA_SELECT_INTERLEAVE":
     env_bool("MLA_SELECT_INTERLEAVE", default=True),
+    # Chunked KDA: the intra-chunk work (decays, triangular inverse, WY terms)
+    # runs batched over all chunks before the scan, which then carries only
+    # the state recurrence (3 small matmuls per chunk); 0 runs it all inside
+    # the scan.
+    "KDA_PREP_OUTSIDE_SCAN":
+    env_bool("KDA_PREP_OUTSIDE_SCAN", default=True),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which
