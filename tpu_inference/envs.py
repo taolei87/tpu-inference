@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     GLM5_MOE_TOKEN_SPLITS: int = 1
     MLA_SELECT_INTERLEAVE: bool = True
     KDA_PREP_OUTSIDE_SCAN: bool = True
+    KDA_RECURRENT_KERNEL: str = "1"
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -605,6 +606,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the scan.
     "KDA_PREP_OUTSIDE_SCAN":
     env_bool("KDA_PREP_OUTSIDE_SCAN", default=True),
+    # Recurrent KDA steps (decode, speculative verify windows) in the Pallas
+    # kernel `kernels/kda/recurrent.py`: "1" on TPU, "0" never (XLA ops),
+    # "interpret" also off TPU in Pallas interpret mode (tests).
+    "KDA_RECURRENT_KERNEL":
+    lambda: os.getenv("KDA_RECURRENT_KERNEL", "1"),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which

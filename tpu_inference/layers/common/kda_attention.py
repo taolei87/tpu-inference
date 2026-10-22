@@ -45,6 +45,7 @@ from jax.sharding import PartitionSpec as P
 import tpu_inference.envs as envs
 from tpu_inference.kernels.gdn.reference.ragged_gated_delta_rule_chunked import \
     pack_inputs_single_stream
+from tpu_inference.kernels.kda.recurrent import kda_recurrent
 from tpu_inference.layers.common.ragged_conv1d_jax import ragged_conv1d
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
@@ -303,10 +304,17 @@ def ragged_kda_decode(q,
     """
     T = q.shape[0]
     dk = k.shape[-1]
-    q = _l2norm(q) * (dk**-0.5)
-    k = _l2norm(k)
     slots = state_indices[:T]
     read = slots if read_indices is None else read_indices[:T]
+    if _recurrent_kernel_mode()[0] and recurrent_state.dtype == jnp.float32:
+        valid = jnp.arange(T) < distribution[2]
+        return _recurrent_windows(recurrent_state[read], recurrent_state,
+                                  jnp.zeros(v.shape,
+                                            jnp.float32), q, k, v, g, beta,
+                                  jnp.arange(T)[:, None], valid[:, None],
+                                  slots[:, None])
+    q = _l2norm(q) * (dk**-0.5)
+    k = _l2norm(k)
     S = recurrent_state[read].astype(jnp.float32)  # [T, H, dk, dv]
     S = S * jnp.exp(g.astype(jnp.float32))[..., None]
     kv = jnp.einsum("thkv,thk->thv", S, k)
@@ -437,12 +445,42 @@ def ragged_kda_spec(q,
                               beta, idx[:R], ok[:R], write[:R])
 
 
+def _recurrent_kernel_mode():
+    """(use the Pallas recurrent kernel, in interpret mode)."""
+    mode = envs.KDA_RECURRENT_KERNEL
+    if mode == "interpret":
+        return True, True
+    return mode == "1" and jax.default_backend() == "tpu", False
+
+
 def _recurrent_windows(S, state, out, q, k, v, g, beta, idx, ok, write):
     """Runs each request's window tokens (idx [R, group], valid ok) from its
     state S [R, H, dk, dv] f32, writing every token's output into out and the
     state after it into its write slot."""
     T, dk = q.shape[0], k.shape[-1]
     qn, kn = _l2norm(q) * (dk**-0.5), _l2norm(k)
+    use_kernel, interpret = _recurrent_kernel_mode()
+    if use_kernel and state.dtype == jnp.float32:
+
+        def cols(x):  # [T, H, d] -> [R, H, d, G]
+            return jnp.transpose(x[idx].astype(jnp.float32), (0, 2, 3, 1))
+
+        state, o = kda_recurrent(
+            S,
+            cols(qn),
+            cols(kn),
+            cols(g),
+            jnp.transpose(v[idx].astype(jnp.float32), (0, 2, 1, 3)),
+            jnp.transpose(beta[idx].astype(jnp.float32), (0, 2, 1))[:, :,
+                                                                    None],
+            state,
+            jnp.clip(write, 0, state.shape[0] - 1).astype(jnp.int32),
+            ok.astype(jnp.int32),
+            interpret=interpret)
+        o = jnp.transpose(o, (0, 2, 1, 3))  # [R, G, H, dv]
+        out = out.at[jnp.where(ok, idx, T)].set(o.astype(out.dtype),
+                                                mode="drop")
+        return state, out
     oob = state.shape[0]
     for t in range(idx.shape[1]):
         i = idx[:, t]
@@ -508,6 +546,12 @@ def ragged_kda_decode_spec(q,
                              block_size=block_size)
     read = slot(jnp.where(valid, positions - 1, -1))
     write = jnp.where(valid, slot(positions), recurrent_state.shape[0])
+    if _recurrent_kernel_mode()[0] and recurrent_state.dtype == jnp.float32:
+        return _recurrent_windows(recurrent_state[read], recurrent_state,
+                                  jnp.zeros(v.shape,
+                                            jnp.float32), q, k, v, g, beta,
+                                  jnp.arange(T)[:, None], valid[:, None],
+                                  write[:, None])
     S, out = _decode_step(recurrent_state[read].astype(jnp.float32),
                           _l2norm(q) * (dk**-0.5), _l2norm(k), v, g, beta)
     return recurrent_state.at[write].set(S.astype(recurrent_state.dtype),

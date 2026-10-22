@@ -686,3 +686,62 @@ def test_prefix_caching_with_spec_decode(tp):
             assert _rel(np.asarray(rec[slot]), ref_rec[0]) < 1e-4, (r, j)
             if tp == 1:
                 assert _rel(np.asarray(conv[slot]), ref_conv[0]) < 1e-5, (r, j)
+
+
+@pytest.mark.parametrize("group", [1, 4])
+def test_recurrent_kernel_matches_xla(group, monkeypatch):
+    """The Pallas recurrent kernel (interpret mode) against the XLA ops on
+    the decode and window paths, with small-norm q / k: the paths must
+    l2-normalize them exactly once (_l2norm's eps matters at this scale)."""
+    rng = np.random.default_rng(17)
+    T, R, N, d = 8, 4, 20, D_HEAD
+    q, k = (jnp.asarray(1e-3 * rng.standard_normal((T, H, d)), jnp.float32)
+            for _ in range(2))
+    v = jnp.asarray(rng.standard_normal((T, H, d)), jnp.float32)
+    g = jnp.asarray(-rng.random((T, H, d)), jnp.float32)
+    beta = jnp.asarray(rng.random((T, H)), jnp.float32)
+    state = rng.standard_normal((N, H, d, d)).astype(np.float32)
+    dist = jnp.asarray([3, 3, 3], jnp.int32)
+    base = jnp.asarray([1, 6, 11, 0], jnp.int32)
+    pos = jnp.asarray([5, 9, 2, 0, 0, 0, 0, 0], jnp.int32)
+    results = []
+    for mode in ((False, False), (True, True)):
+        monkeypatch.setattr(K, "_recurrent_kernel_mode", lambda m=mode: m)
+        if group == 1:
+            st, out = K.ragged_kda_decode(q[:R], k[:R], v[:R], g[:R], beta[:R],
+                                          jnp.asarray(state), base, dist,
+                                          base + 2)
+        else:
+            st, out = K.ragged_kda_decode_spec(q[:R],
+                                               k[:R],
+                                               v[:R],
+                                               g[:R],
+                                               beta[:R],
+                                               jnp.asarray(state),
+                                               pos[:R],
+                                               base,
+                                               dist,
+                                               group=group)
+            qsl = jnp.asarray([0, 2, 4, 5, 5], jnp.int32)
+            st2, out2 = K.ragged_kda_windows(q,
+                                             k,
+                                             v,
+                                             g,
+                                             beta,
+                                             jnp.asarray(state),
+                                             qsl,
+                                             base,
+                                             dist,
+                                             jnp.asarray([True] * 3 + [False]),
+                                             pos,
+                                             group=group)
+            st, out = (st, st2), (out[:3], out2[:5])
+        results.append((st, out))
+    (sa, oa), (sb, ob) = results
+    for a, b in zip(jax.tree.leaves(sa), jax.tree.leaves(sb)):
+        assert _rel(b, a) < 1e-5
+    # valid tokens only (padding rows are zeros from the kernel, garbage
+    # from the XLA ops; both are unused)
+    for a, b in zip(jax.tree.leaves(oa), jax.tree.leaves(ob)):
+        assert _rel(b[:3] if group == 1 else b,
+                    a[:3] if group == 1 else a) < 1e-5
