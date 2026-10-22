@@ -331,7 +331,8 @@ def ragged_kda_decode(q,
     dk = k.shape[-1]
     slots = state_indices[:T]
     read = slots if read_indices is None else read_indices[:T]
-    if _recurrent_kernel_mode()[0] and recurrent_state.dtype == jnp.float32:
+    if (_recurrent_kernel_mode()[0] and envs.KDA_RECURRENT_KERNEL_DECODE
+            and recurrent_state.dtype == jnp.float32):
         valid = jnp.arange(T) < distribution[2]
         return _recurrent_windows(recurrent_state[read], recurrent_state,
                                   jnp.zeros(v.shape,
@@ -579,7 +580,8 @@ def ragged_kda_decode_spec(q,
                              block_size=block_size)
     read = slot(jnp.where(valid, positions - 1, -1))
     write = jnp.where(valid, slot(positions), recurrent_state.shape[0])
-    if _recurrent_kernel_mode()[0] and recurrent_state.dtype == jnp.float32:
+    if (_recurrent_kernel_mode()[0] and envs.KDA_RECURRENT_KERNEL_DECODE
+            and recurrent_state.dtype == jnp.float32):
         return _recurrent_windows(recurrent_state[read], recurrent_state,
                                   jnp.zeros(v.shape,
                                             jnp.float32), q, k, v, g, beta,

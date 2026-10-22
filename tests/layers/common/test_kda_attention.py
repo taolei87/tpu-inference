@@ -704,6 +704,7 @@ def test_recurrent_kernel_matches_xla(group, monkeypatch):
     dist = jnp.asarray([3, 3, 3], jnp.int32)
     base = jnp.asarray([1, 6, 11, 0], jnp.int32)
     pos = jnp.asarray([5, 9, 2, 0, 0, 0, 0, 0], jnp.int32)
+    monkeypatch.setenv("KDA_RECURRENT_KERNEL_DECODE", "1")
     results = []
     for mode in ((False, False), (True, True)):
         monkeypatch.setattr(K, "_recurrent_kernel_mode", lambda m=mode: m)

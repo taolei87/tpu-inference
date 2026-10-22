@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     MLA_SELECT_INTERLEAVE: bool = True
     KDA_PREP_OUTSIDE_SCAN: bool = True
     KDA_RECURRENT_KERNEL: str = "1"
+    KDA_RECURRENT_KERNEL_DECODE: bool = False
     KDA_CHUNK_KERNEL: str = "1"
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
@@ -612,6 +613,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "interpret" also off TPU in Pallas interpret mode (tests).
     "KDA_RECURRENT_KERNEL":
     lambda: os.getenv("KDA_RECURRENT_KERNEL", "1"),
+    # Also run the single-token decode steps in that kernel (off: on v6e the
+    # XLA ops are faster there; the kernel wins on multi-token windows).
+    "KDA_RECURRENT_KERNEL_DECODE":
+    env_bool("KDA_RECURRENT_KERNEL_DECODE", default=False),
     # Chunked KDA's state recurrence (with KDA_PREP_OUTSIDE_SCAN) in the
     # Pallas kernel `kernels/kda/chunk_scan.py` instead of a lax.scan; same
     # values as KDA_RECURRENT_KERNEL.
