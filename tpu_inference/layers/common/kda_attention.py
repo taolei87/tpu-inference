@@ -45,6 +45,7 @@ from jax.sharding import PartitionSpec as P
 import tpu_inference.envs as envs
 from tpu_inference.kernels.gdn.reference.ragged_gated_delta_rule_chunked import \
     pack_inputs_single_stream
+from tpu_inference.kernels.kda.chunk_scan import kda_chunk_scan
 from tpu_inference.kernels.kda.recurrent import kda_recurrent
 from tpu_inference.layers.common.ragged_conv1d_jax import ragged_conv1d
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -261,6 +262,30 @@ def _chunked_final(q, k, v, g, beta, recurrent_state, query_start_loc, read,
 
     chunks = (to_chunks(pq), to_chunks(pk), to_chunks(pv), to_chunks(pg),
               to_chunks(pbeta))
+    if envs.KDA_PREP_OUTSIDE_SCAN and _chunk_kernel_mode()[0]:
+        u, w, attn, q_dec, k_dec, decay = jax.vmap(_kda_chunk_prep)(*chunks)
+        max_reqs = init.shape[0]
+        # each chunk's sequence; chunks past the valid sequences (stream
+        # padding) go to an extra dummy sequence
+        starts = jnp.arange(n_chunks, dtype=jnp.int32) * chunk_size
+        seq = jnp.searchsorted(new_qsl[1:], starts, side="right")
+        seq = jnp.where(starts < new_qsl[distribution[2]], seq,
+                        max_reqs).astype(jnp.int32)
+        first = jnp.concatenate([jnp.ones(1, bool), seq[1:]
+                                 != seq[:-1]]).astype(jnp.int32)
+        out, final = kda_chunk_scan(u,
+                                    w,
+                                    attn,
+                                    q_dec,
+                                    k_dec,
+                                    decay[..., None],
+                                    seq,
+                                    first,
+                                    jnp.concatenate(
+                                        [init, jnp.zeros_like(init[:1])]),
+                                    interpret=_chunk_kernel_mode()[1])
+        out = jnp.swapaxes(out, 1, 2).reshape(-1, H, dv)[idx]  # [T, H, dv]
+        return final[:max_reqs], out
     if envs.KDA_PREP_OUTSIDE_SCAN:
         prep = jax.vmap(_kda_chunk_prep)(*chunks)
 
@@ -447,7 +472,15 @@ def ragged_kda_spec(q,
 
 def _recurrent_kernel_mode():
     """(use the Pallas recurrent kernel, in interpret mode)."""
-    mode = envs.KDA_RECURRENT_KERNEL
+    return _kernel_mode(envs.KDA_RECURRENT_KERNEL)
+
+
+def _chunk_kernel_mode():
+    """(use the Pallas chunk-scan kernel, in interpret mode)."""
+    return _kernel_mode(envs.KDA_CHUNK_KERNEL)
+
+
+def _kernel_mode(mode):
     if mode == "interpret":
         return True, True
     return mode == "1" and jax.default_backend() == "tpu", False
