@@ -109,9 +109,44 @@ def _decay_mix(x, y, gc, sub):
     off = jnp.where(blk[:, None] > blk[None, :], off, 0.0)
     dd = jnp.exp(jnp.minimum(gs[:, :, :, None] - gs[:, :, None], 0.0))
     diag = jnp.einsum("hnid,hnjd,hnijd->hnij", xs, ys, dd)  # [H, n, sub, sub]
+    diag = jnp.where(jnp.tril(jnp.ones((sub, sub), bool)), diag, 0.0)
+    if envs.KDA_PREP_V2:
+        # the diagonal blocks on the [H, c, c] layout (off is zero there):
+        # each block row plus its block padded to the row's width
+        rows = [
+            off[:, b * sub:(b + 1) * sub] +
+            jnp.pad(diag[:, b], ((0, 0), (0, 0), (b * sub, c - (b + 1) * sub)))
+            for b in range(n)
+        ]
+        return jnp.concatenate(rows, axis=1)
     diag = jnp.einsum("hnij,nm->hnimj", diag,
                       jnp.eye(n, dtype=diag.dtype)).reshape(H, c, c)
-    return off + jnp.where(jnp.tril(jnp.ones((c, c), bool)), diag, 0.0)
+    return off + diag
+
+
+def _nilpotent_inverse(m, order):
+    """(I + m)^-1 for m with m^order = 0 (order a power of two):
+    (I - m)(I + m^2)(I + m^4)..., on whole matrices."""
+    eye = jnp.eye(m.shape[-1], dtype=m.dtype)
+    r, p = eye - m, m
+    while order > 2:
+        p = p @ p
+        r = r + r @ p
+        order //= 2
+    return r
+
+
+def _unit_lower_inverse_v2(a, blk=8):
+    """(I + a)^-1 for strictly lower a [..., c, c] on whole [c, c] tiles:
+    with D the blk x blk diagonal blocks of a and L the rest,
+    I + a = (I + D)(I + M) with M = (I + D)^-1 L strictly block-lower, so
+    (I + a)^-1 = (I + M)^-1 (I + D)^-1; D^blk = 0 and M^(c / blk) = 0."""
+    c = a.shape[-1]
+    blk_id = jnp.arange(c) // blk
+    same = blk_id[:, None] == blk_id[None, :]
+    d_inv = _nilpotent_inverse(jnp.where(same, a, 0.0), blk)
+    m = d_inv @ jnp.where(same, 0.0, a)
+    return _nilpotent_inverse(m, c // blk) @ d_inv
 
 
 def _unit_lower_inverse(a, blk=8):
@@ -119,6 +154,8 @@ def _unit_lower_inverse(a, blk=8):
     substitution: the inverses D_i of the blk x blk diagonal blocks, then the
     blocks below them by matmuls, X[i, :i] = -D_i (L[i, :i] X[:i, :i])."""
     H, c, _ = a.shape
+    if envs.KDA_PREP_V2 and c % blk == 0 and (c // blk) & (c // blk - 1) == 0:
+        return _unit_lower_inverse_v2(a, blk)
     n = c // blk
     eye = jnp.eye(blk, dtype=a.dtype)
     lb = a.reshape(H, n, blk, n, blk)

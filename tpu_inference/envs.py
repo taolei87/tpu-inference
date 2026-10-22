@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     KDA_RECURRENT_KERNEL: str = "1"
     KDA_RECURRENT_KERNEL_DECODE: bool = False
     KDA_CHUNK_KERNEL: str = "1"
+    KDA_PREP_V2: bool = True
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -622,6 +623,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # values as KDA_RECURRENT_KERNEL.
     "KDA_CHUNK_KERNEL":
     lambda: os.getenv("KDA_CHUNK_KERNEL", "1"),
+    # Chunk prep on whole [c, c] tiles: the decay mix's diagonal blocks by
+    # slice updates and the WY inverse by block doubling, instead of 8 x 8 /
+    # 16 x 16 block layouts (which tile badly on TPU).
+    "KDA_PREP_V2":
+    env_bool("KDA_PREP_V2", default=True),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which

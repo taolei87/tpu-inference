@@ -746,3 +746,23 @@ def test_recurrent_kernel_matches_xla(group, monkeypatch):
     for a, b in zip(jax.tree.leaves(oa), jax.tree.leaves(ob)):
         assert _rel(b[:3] if group == 1 else b,
                     a[:3] if group == 1 else a) < 1e-5
+
+
+@pytest.mark.parametrize("scale", [0.05, 1.0])
+def test_unit_lower_inverse_matches_numpy(scale):
+    """(I + A)^-1 of the WY representation (A from unit keys, betas and
+    decays up to the gate's lower bound), whole-tile block doubling vs
+    numpy."""
+    rng = np.random.default_rng(3)
+    Hh, c, d = 3, 64, 128
+    k = rng.standard_normal((Hh, c, d))
+    k /= np.linalg.norm(k, axis=-1, keepdims=True)
+    beta = 1 / (1 + np.exp(-rng.standard_normal((Hh, c))))
+    g = -5.0 * scale / (1 + np.exp(-rng.standard_normal((Hh, c, d))))
+    gc = np.cumsum(g, axis=1)
+    a = np.einsum("hid,hjd,hijd->hij", k * beta[..., None], k,
+                  np.exp(np.minimum(gc[:, :, None] - gc[:, None], 0)))
+    a = np.where(np.tril(np.ones((c, c), bool), -1), a, 0)
+    want = np.linalg.inv(np.eye(c) + a)
+    got = np.asarray(K._unit_lower_inverse_v2(jnp.asarray(a, jnp.float32)))
+    assert _rel(got, want) < 1e-6
