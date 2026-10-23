@@ -265,6 +265,47 @@ def ragged_kda_chunked(q,
     return recurrent_state.at[state_indices].set(new), out
 
 
+def _pack_by_gather(q, k, v, g, beta, query_start_loc, distribution,
+                    chunk_size, compute_dtype):
+    """`pack_inputs_single_stream` (same outputs) with one gather: every
+    packed row reads its source token, or is zero padding."""
+    T = q.shape[0]
+    num_seqs = query_start_loc.shape[0] - 1
+    n_valid = distribution[2]
+    qsl = jnp.where(
+        jnp.arange(num_seqs + 1) <= n_valid, query_start_loc,
+        query_start_loc[n_valid])
+    lens = qsl[1:] - qsl[:-1]
+    padded = -(-lens // chunk_size) * chunk_size
+    new_qsl = jnp.concatenate([jnp.zeros(1, padded.dtype), jnp.cumsum(padded)])
+    n_packed = -(-(T + num_seqs * chunk_size) // chunk_size) * chunk_size
+    p = jnp.arange(n_packed)
+    seq = jnp.clip(
+        jnp.searchsorted(new_qsl, p, side="right") - 1, 0, num_seqs - 1)
+    off = p - new_qsl[seq]
+    real = off < lens[seq]
+    src = jnp.clip(qsl[seq] + off, 0, T - 1)
+    rows = jnp.concatenate(
+        [x.astype(compute_dtype)
+         for x in (q, k, v, beta[..., None])] + [g.astype(jnp.float32)],
+        -1)  # [T, H, 3 d + 1 + d]
+    packed = jnp.where(real[:, None, None], rows[src], 0)
+    d, dv = q.shape[-1], v.shape[-1]
+    pq, pk = packed[..., :d], packed[..., d:2 * d]
+    pv = packed[..., 2 * d:2 * d + dv]
+    pbeta = packed[..., 2 * d + dv]
+    pg = packed[..., 2 * d + dv + 1:].astype(jnp.float32)
+    reset = jnp.zeros(n_packed // chunk_size,
+                      bool).at[new_qsl[:-1] // chunk_size].set(True,
+                                                               mode="drop")
+    # each token's packed row
+    tok = jnp.arange(T)
+    tseq = jnp.clip(
+        jnp.searchsorted(qsl, tok, side="right") - 1, 0, num_seqs - 1)
+    idx = new_qsl[tseq] + tok - qsl[tseq]
+    return pq, pk, pv, pg, pbeta, reset, new_qsl, idx
+
+
 def _chunked_final(q, k, v, g, beta, recurrent_state, query_start_loc, read,
                    distribution, has_initial_state, *, chunk_size: int):
     """The chunked pass from the states in slots `read`: (final state per
@@ -272,7 +313,9 @@ def _chunked_final(q, k, v, g, beta, recurrent_state, query_start_loc, read,
     dk = k.shape[-1]
     q = _l2norm(q) * (dk**-0.5)
     k = _l2norm(k)
-    pq, pk, pv, pg, pbeta, reset, new_qsl, idx = pack_inputs_single_stream(
+    pack = (_pack_by_gather
+            if envs.KDA_PACK_GATHER else pack_inputs_single_stream)
+    pq, pk, pv, pg, pbeta, reset, new_qsl, idx = pack(
         q,
         k,
         v.astype(jnp.float32),

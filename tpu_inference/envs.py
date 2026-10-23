@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     KDA_RECURRENT_KERNEL_DECODE: bool = False
     KDA_CHUNK_KERNEL: str = "1"
     KDA_PREP_V2: bool = True
+    KDA_PACK_GATHER: bool = True
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -628,6 +629,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 16 x 16 block layouts (which tile badly on TPU).
     "KDA_PREP_V2":
     env_bool("KDA_PREP_V2", default=True),
+    # Chunked KDA packs the ragged batch into chunk-aligned rows with one
+    # gather (each packed row reads its source token) instead of scatters.
+    "KDA_PACK_GATHER":
+    env_bool("KDA_PACK_GATHER", default=True),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which

@@ -766,3 +766,41 @@ def test_unit_lower_inverse_matches_numpy(scale):
     want = np.linalg.inv(np.eye(c) + a)
     got = np.asarray(K._unit_lower_inverse_v2(jnp.asarray(a, jnp.float32)))
     assert _rel(got, want) < 1e-6
+
+
+@pytest.mark.parametrize("lens,n_valid", [([1, 1, 37, 70, 75], 5), ([50], 1),
+                                          ([3, 130, 0], 2), ([64, 64], 2)])
+def test_pack_by_gather_matches_scatter(lens, n_valid):
+    """The gather packer gives the scatter packer's chunk-aligned stream (up
+    to the rows past the valid sequences, which nothing reads)."""
+    from tpu_inference.kernels.gdn.reference.ragged_gated_delta_rule_chunked import \
+        pack_inputs_single_stream
+    rng = np.random.default_rng(len(lens))
+    T, d, max_reqs = sum(lens) + 5, 16, 8
+    q, k, v, g = (jnp.asarray(rng.standard_normal((T, H, d)), jnp.float32)
+                  for _ in range(4))
+    beta = jnp.asarray(rng.random((T, H)), jnp.float32)
+    qsl = np.full(max_reqs + 1, sum(lens[:n_valid]), np.int32)
+    qsl[:n_valid + 1] = np.concatenate([[0], np.cumsum(lens[:n_valid])])
+    dist = jnp.asarray([0, n_valid, n_valid], jnp.int32)
+    a = pack_inputs_single_stream(q,
+                                  k,
+                                  v,
+                                  g,
+                                  beta,
+                                  jnp.asarray(qsl),
+                                  dist,
+                                  64,
+                                  compute_dtype=jnp.float32)
+    b = K._pack_by_gather(q, k, v, g, beta, jnp.asarray(qsl), dist, 64,
+                          jnp.float32)
+    end = int(a[6][n_valid])
+    for x, y in zip(a[:5], b[:5]):  # packed q, k, v, g, beta
+        assert x.shape == y.shape
+        np.testing.assert_array_equal(np.asarray(x)[:end], np.asarray(y)[:end])
+    for x, y in zip(a[5:7], b[5:7]):  # reset mask, packed starts
+        np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
+    n_tok = sum(lens[:n_valid])
+    np.testing.assert_array_equal(
+        np.asarray(a[7])[:n_tok],
+        np.asarray(b[7])[:n_tok])
