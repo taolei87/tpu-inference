@@ -54,13 +54,24 @@ class _Node(JaxModule):
 # input-side projections, rows of the output-side ones) so the ~1.1 GB tower
 # doesn't take its full size from every chip's KV cache; XLA inserts the
 # collectives. Norms and the small patch embedding stay replicated.
-TP = ShardingAxisName.ATTN_HEAD
-COLS, ROWS = (None, TP), (TP, None)
+# (resolved when the parameters are built: ShardingAxisName picks its axis
+# names on first use, from settings a test may make after import)
+COLS, ROWS, CHANNELS = "cols", "rows", "channels"
+
+
+def _spec(kind):
+    tp = ShardingAxisName.ATTN_HEAD
+    return {
+        COLS: (None, tp),
+        ROWS: (tp, None),
+        CHANNELS: (tp, None, None, None)
+    }[kind]
 
 
 def _param(rng, shape, dtype, sharding=None):
     return nnx.Param(init_fn(rng.params(), shape, dtype),
-                     out_sharding=sharding or (None, ) * len(shape),
+                     out_sharding=(_spec(sharding) if sharding else
+                                   (None, ) * len(shape)),
                      eager_sharding=False)
 
 
@@ -233,8 +244,7 @@ class Glm5NextVisionModel(JaxModule):
         self.post_layernorm = _Node()
         self.post_layernorm.weight = _param(rng, (dim, ), dtype)
         self.downsample = _Node()
-        self.downsample.weight = _param(rng, (out, dim, m, m), dtype,
-                                        (TP, None, None, None))
+        self.downsample.weight = _param(rng, (out, dim, m, m), dtype, CHANNELS)
         self.downsample.bias = _param(rng, (out, ), dtype)
         self.merger = Glm5NextVisionMLP(out, cfg.projection_intermediate_size,
                                         cfg.swiglu_limit, dtype, rng, False)
