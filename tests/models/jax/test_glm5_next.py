@@ -59,6 +59,10 @@ _GLM_ADDITIONAL_CONFIG = {
 @pytest.fixture(autouse=True)
 def _new_model_design(monkeypatch):
     monkeypatch.setenv("NEW_MODEL_DESIGN", "1")
+    # ShardingAxisName picks its axis names on first use, maybe in an earlier
+    # test without NEW_MODEL_DESIGN: choose again under it
+    from tpu_inference.layers.common.sharding import ShardingAxisName
+    monkeypatch.setattr(ShardingAxisName, "_cls", None)
 
 
 @pytest.fixture(autouse=True)
