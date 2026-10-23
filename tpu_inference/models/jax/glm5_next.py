@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from vllm.model_executor.models.utils import WeightsMapper
 
@@ -205,7 +205,10 @@ class Glm5NextMoE(JaxModule):
 
     def __call__(self,
                  x: jax.Array,
-                 num_valid_tokens: Optional[jax.Array] = None) -> jax.Array:
+                 num_valid_tokens: Optional[jax.Array] = None,
+                 scatter_output: bool = False) -> jax.Array:
+        """scatter_output: return the output sharded by hidden column over
+        the reduce axes (a reduce-scatter instead of the all-reduce)."""
         logits = self.gate(x)
         # GLM5_MOE_TOKEN_SPLITS > 1 runs a prefill-sized step's routed experts
         # as that many independent token slices, so one slice's SparseCore
@@ -229,7 +232,16 @@ class Glm5NextMoE(JaxModule):
         routed = jnp.concatenate(parts) if n > 1 else parts[0]
         out = (routed * self.routed_scaling_factor).astype(
             x.dtype) + self.shared_experts(x)
-        if self.reduce_axes:
+        if self.reduce_axes and scatter_output:
+            out = jax.shard_map(
+                lambda a: jax.lax.psum_scatter(
+                    a, self.reduce_axes, scatter_dimension=1, tiled=True),
+                mesh=self.mesh,
+                in_specs=P(),
+                out_specs=P(None, self.reduce_axes),
+                check_vma=False,
+            )(out)
+        elif self.reduce_axes:
             out = jax.shard_map(
                 lambda a: jax.lax.psum(a, self.reduce_axes),
                 mesh=self.mesh,
@@ -434,6 +446,26 @@ class Glm5NextMLA(JaxModule):
         return ((latent, pooled), (tail, )), self.output(o_lat)
 
 
+def _shard_residual(num_tokens: int, mesh: Mesh) -> bool:
+    """Whether a step of num_tokens (static) keeps the mHC streams sharded by
+    hidden column: MHC_SHARD_MIN_TOKENS, TP > 1, no attention DP."""
+    n = envs.MHC_SHARD_MIN_TOKENS
+    return bool(
+        n and num_tokens >= n and mesh is not None
+        and get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD) > 1
+        and get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) == 1)
+
+
+def _hidden_sharded(x: jax.Array, mesh: Mesh) -> jax.Array:
+    """x [..., D] sharded by its last (hidden) dimension over the TP axis."""
+    spec = P(*([None] * (x.ndim - 1)), ShardingAxisName.ATTN_HEAD)
+    return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, spec))
+
+
+def _replicated(x: jax.Array, mesh: Mesh) -> jax.Array:
+    return jax.lax.with_sharding_constraint(x, NamedSharding(mesh, P()))
+
+
 def _layer_metadata(attention_metadata, name: str) -> AttentionMetadata:
     """A layer's metadata: hybrid models get one entry per layer
     (GroupedAttentionMetadata), single-group runs one shared object."""
@@ -515,10 +547,19 @@ class Glm5NextDecoderLayer(JaxModule):
                 getattr(self, f"hc_{name}_scale")[...],
                 getattr(self, f"hc_{name}_base")[...])
 
-    def __call__(self, kv_cache, streams: jax.Array,
-                 attention_metadata: AttentionMetadata):
-        """streams [T, hc, D] -> (new kv_cache, new streams)."""
-        kw = dict(use_kernel=self.use_mhc_kernel, mesh=self.mesh)
+    def __call__(self,
+                 kv_cache,
+                 streams: jax.Array,
+                 attention_metadata: AttentionMetadata,
+                 shard_residual: bool = False):
+        """streams [T, hc, D] -> (new kv_cache, new streams). shard_residual:
+        the streams (and each block's output) are sharded by hidden column
+        over the TP axis; mHC runs as XLA ops on the local columns and each
+        block's input is all-gathered (`_shard_residual`)."""
+        kw = dict(use_kernel=self.use_mhc_kernel and not shard_residual,
+                  mesh=self.mesh)
+        rep = _replicated if shard_residual else (lambda x, m: x)
+        cols = _hidden_sharded if shard_residual else (lambda x, m: x)
         # named scopes label the ops for profiles
         attn = "mla" if isinstance(self.self_attn, Glm5NextMLA) else "kda"
         ffn = "moe" if isinstance(self.mlp, Glm5NextMoE) else "mlp"
@@ -526,19 +567,23 @@ class Glm5NextDecoderLayer(JaxModule):
             post, comb, h = mhc.mhc_pre(streams, *self._site("attn"),
                                         self.mhc_cfg, **kw)
         with jax.named_scope(attn):
-            kv_cache, h = self.self_attn(kv_cache, self.input_layernorm(h),
-                                         attention_metadata)
+            kv_cache, h = self.self_attn(
+                kv_cache, self.input_layernorm(rep(h, self.mesh)),
+                attention_metadata)
+            h = cols(h, self.mesh)
         with jax.named_scope("mhc"):
             streams, post, comb, h = mhc.mhc_post_pre(h, streams, post, comb,
                                                       *self._site("ffn"),
                                                       self.mhc_cfg, **kw)
         with jax.named_scope(ffn):
-            h = self.post_attention_layernorm(h)
+            h = self.post_attention_layernorm(rep(h, self.mesh))
             if ffn == "moe":
-                h = self.mlp(h, _num_valid_tokens(attention_metadata,
-                                                  self.mesh))
+                h = self.mlp(h,
+                             _num_valid_tokens(attention_metadata, self.mesh),
+                             scatter_output=shard_residual)
             else:
                 h = self.mlp(h)
+            h = cols(h, self.mesh)
         with jax.named_scope("mhc"):
             return kv_cache, mhc.mhc_post(h, streams, post, comb, **kw)
 
@@ -571,6 +616,7 @@ class Glm5NextModel(JaxModule):
         config = model_config.hf_text_config
         dtype = model_config.dtype
         self.config = config
+        self.mesh = mesh
         quant_config = vllm_config.quant_config
         self.embed_tokens = JaxEmbed(
             num_embeddings=model_config.get_vocab_size(),
@@ -605,20 +651,27 @@ class Glm5NextModel(JaxModule):
         hc = self.config.hc_mult
         streams = jnp.broadcast_to(x[:, None, :],
                                    (x.shape[0], hc, x.shape[-1]))
+        shard = _shard_residual(x.shape[0], self.mesh)
+        if shard:
+            streams = _hidden_sharded(streams, self.mesh)
         kv_caches = list(kv_caches)
         for i, layer in enumerate(self.layers):
             name = glm5_next_kv_cache.layer_name(i)
             idx = layer_name_to_kv_cache[name]
             md = _layer_metadata(attention_metadata, name)
             if layer.is_kda:
-                kv_caches[idx], streams = layer(kv_caches[idx], streams, md)
+                kv_caches[idx], streams = layer(kv_caches[idx], streams, md,
+                                                shard)
                 continue
             tail_name = glm5_next_kv_cache.indexer_tail_name(i)
             tidx = layer_name_to_kv_cache[tail_name]
             (kv_caches[idx], kv_caches[tidx]), streams = layer(
                 (kv_caches[idx], kv_caches[tidx]), streams,
-                (md, _layer_metadata(attention_metadata, tail_name)))
-        return kv_caches, self.norm(mhc.mhc_head(streams))
+                (md, _layer_metadata(attention_metadata, tail_name)), shard)
+        out = mhc.mhc_head(streams)
+        if shard:
+            out = _replicated(out, self.mesh)
+        return kv_caches, self.norm(out)
 
 
 class Glm5NextForCausalLM(JaxModule, LoadableWithIterator):

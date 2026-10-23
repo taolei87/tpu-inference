@@ -58,11 +58,13 @@ def mhc_pre_xla(streams, fn, scale, base, cfg: MHCConfig):
     collapsed [T, D] in streams' dtype)."""
     T, hc, D = streams.shape
     f32 = jnp.float32
-    x = streams.reshape(T, hc * D).astype(f32)
-    flat = x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + cfg.rms_eps)
-    mix = jnp.einsum("tk,mk->tm",
+    # (no [T, hc * D] reshape: it would scramble a sharding of D)
+    x = streams.astype(f32)
+    flat = x * jax.lax.rsqrt(
+        jnp.mean(x * x, (1, 2), keepdims=True) + cfg.rms_eps)
+    mix = jnp.einsum("thd,mhd->tm",
                      flat,
-                     fn.astype(f32),
+                     fn.astype(f32).reshape(fn.shape[0], hc, D),
                      precision=jax.lax.Precision.HIGHEST)
     scale, base = scale.astype(f32), base.astype(f32)
     pre = jax.nn.sigmoid(mix[:, :hc] * scale[0] + base[:hc]) + cfg.hc_eps

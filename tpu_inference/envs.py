@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     KDA_CHUNK_KERNEL: str = "1"
     KDA_PREP_V2: bool = True
     KDA_PACK_GATHER: bool = True
+    MHC_SHARD_MIN_TOKENS: int = 0
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
@@ -633,6 +634,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gather (each packed row reads its source token) instead of scatters.
     "KDA_PACK_GATHER":
     env_bool("KDA_PACK_GATHER", default=True),
+    # GLM-5.3-Flash steps with at least this many tokens keep the mHC
+    # residual streams sharded by hidden column over the tensor-parallel axis
+    # (reduce-scatter after each block, all-gather before it, mHC on 1/TP of
+    # the columns) instead of replicated; 0 never.
+    "MHC_SHARD_MIN_TOKENS":
+    lambda: int(os.getenv("MHC_SHARD_MIN_TOKENS") or "0"),
     # Gap between token-bucket padding sizes for TPU precompilation. When 0,
     # buckets grow as powers of two; otherwise buckets increase by this gap
     # once past the power-of-two ramp. Previously provided by vllm.envs, which
