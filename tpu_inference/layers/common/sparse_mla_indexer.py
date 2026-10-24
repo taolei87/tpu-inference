@@ -557,9 +557,12 @@ def run_sparse_mla_step(latent,
               block_tables, seq_lens, query_start_loc, distribution,
               tail_slots):
         # the indexer's selection is the same for every head shard: split it
-        # over them by query instead of repeating it
-        split = n_head_shards > 1 and positions.shape[0] % n_head_shards == 0
-        shard = (H, n_head_shards) if split else None
+        # over them by query instead of repeating it. A rank's segment can be
+        # shorter than one query per shard (DP pads a decode segment to 8
+        # tokens, not 16): pad the queries (padding tokens are invalid).
+        T0 = positions.shape[0]
+        pad = -T0 % n_head_shards if n_head_shards > 1 else 0
+        shard = (H, n_head_shards) if n_head_shards > 1 else None
         tail_read = window = None
         if align_block_size is not None and spec_group > 1:
             bt = jnp.clip(tail_slots.reshape(seq_lens.shape[0], -1), 0,
@@ -580,12 +583,17 @@ def run_sparse_mla_step(latent,
                                      block_tables, seq_lens, query_start_loc,
                                      distribution, tail_slots, tail_read,
                                      window)
-        o_lat = sparse_nope_mla(q_lat,
-                                qi,
-                                wts,
+
+        def padq(x):
+            return jnp.pad(x, ((0, pad), ) + ((0, 0), ) *
+                           (x.ndim - 1)) if pad else x
+
+        o_lat = sparse_nope_mla(padq(q_lat),
+                                padq(qi),
+                                padq(wts),
                                 latent,
                                 pooled,
-                                positions,
+                                padq(positions),
                                 block_tables,
                                 seq_lens,
                                 query_start_loc,
@@ -593,7 +601,7 @@ def run_sparse_mla_step(latent,
                                 index_topk=index_topk,
                                 scale=scale,
                                 kvr=kvr,
-                                select_shard=shard)
+                                select_shard=shard)[:T0]
         return latent, pooled, tail, o_lat
 
     tok = P(D, None)

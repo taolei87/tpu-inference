@@ -168,10 +168,13 @@ class _Caches:
                 self.kv_caches.append((jnp.zeros((slots, *lay.tail_shape),
                                                  dtype), ))
 
+    pad_to = 16
+
     def metadata(self, step):
         """step: [(request id, first position, num tokens)], decodes first."""
         # padding tokens, to a multiple of 16 like the runner's token buckets
-        T = -(-(sum(n for _, _, n in step) + 1) // 16) * 16
+        # (pad_to: a DP rank's segment can be shorter)
+        T = -(-(sum(n for _, _, n in step) + 1) // self.pad_to) * self.pad_to
         pos = np.zeros(T, np.int32)
         qsl = np.full(MAX_REQS + 1, sum(n for _, _, n in step), np.int32)
         qsl[0] = 0
@@ -402,6 +405,31 @@ def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, monkeypatch):
             e_ep, e_one = _rel(got[g], ref[g][0]), _rel(one, ref[g][0])
             print("WIDEEP", g, e_ep, e_one)
             assert e_ep < 1.2 * e_one + 2e-3, (g, e_ep, e_one)
+
+
+def test_mla_query_split_with_fewer_tokens_than_head_shards(tmp_path):
+    """The indexer selection is split over the head shards by query; a step
+    whose token count isn't a multiple of the shard count (a DP rank's
+    6-token segment at TP=4) pads the queries instead of dropping the
+    split."""
+    d = str(tmp_path)
+    # top-8 of 8 experts: the MoE needs tokens * top_k % 16 == 0 at 6 tokens
+    MT.write_tiny_checkpoint(d, seed=25, index_topk=16, num_experts_per_tok=8)
+    vllm_config, model, mesh = _build(d, tp=4)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(6)
+    ids = {
+        0: rng.integers(0, text.vocab_size, 32),
+        1: rng.integers(0, text.vocab_size, 2)
+    }
+    ref = _reference(d, ids, sparse="always")
+    caches = _Caches(text)
+    caches.pad_to = 2
+    s1 = _run(model, mesh, caches, [(0, 0, 28), (1, 0, 1)], ids)
+    s2 = _run(model, mesh, caches, [(1, 1, 1), (0, 28, 4)], ids)  # T = 6
+    for rid in ids:
+        h = np.concatenate([s1[rid][0], s2[rid][0]])
+        assert _rel(h, ref[rid][0]) < 1e-4, rid
 
 
 def test_registry(tiny_dir):
