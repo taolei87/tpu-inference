@@ -140,8 +140,10 @@ class Glm5NextRouter(JaxModule):
 def _fused_reduce_axes(experts, shared, mesh: Mesh) -> tuple:
     """The mesh axes to reduce the routed and shared experts' partial sums
     over in one all-reduce, or () to keep their separate all-reduces: needs
-    the TP GMM backend, no attention DP, blockwise-fp8 shared weights (whose
-    matmul can skip its psum) and the same effective tensor-parallel axes."""
+    the TP GMM backend, no attention DP (in-mesh data parallelism is fine:
+    each `data` group reduces its own tokens), blockwise-fp8 shared weights
+    (whose matmul can skip its psum) and the same effective tensor-parallel
+    axes."""
     from tpu_inference.layers.common.moe import MoEBackend
     from tpu_inference.layers.jax.quantization.fp8 import \
         Fp8BlockwiseLinearMethod
@@ -150,8 +152,9 @@ def _fused_reduce_axes(experts, shared, mesh: Mesh) -> tuple:
         axes = (axes, ) if isinstance(axes, str) else axes
         return tuple(a for a in axes if get_mesh_shape_product(mesh, a) > 1)
 
-    if (getattr(experts, "moe_backend", None) != MoEBackend.GMM_TP
-            or get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1
+    attn_dp = set(effective(ShardingAxisName.ATTN_DATA)) - set(
+        effective(ShardingAxisName.MLP_DATA))
+    if (getattr(experts, "moe_backend", None) != MoEBackend.GMM_TP or attn_dp
             or not isinstance(shared.down_proj.quant_method,
                               Fp8BlockwiseLinearMethod)):
         return ()
@@ -218,7 +221,8 @@ class Glm5NextMoE(JaxModule):
             lo = c * (T // n)
             nv = num_valid_tokens
             if nv is not None and n > 1:
-                nv = jnp.clip(nv - lo, 0, T // n)
+                nv = (nv[lo:lo +
+                         T // n] if nv.ndim else jnp.clip(nv - lo, 0, T // n))
             routed, _ = self.experts(
                 x[lo:lo + T // n],
                 logits[lo:lo + T // n],
@@ -230,11 +234,13 @@ class Glm5NextMoE(JaxModule):
         out = (routed * self.routed_scaling_factor).astype(
             x.dtype) + self.shared_experts(x)
         if self.reduce_axes:
+            # tokens stay split over the data-parallel groups
+            tokens = P(ShardingAxisName.MLP_DATA)
             out = jax.shard_map(
                 lambda a: jax.lax.psum(a, self.reduce_axes),
                 mesh=self.mesh,
-                in_specs=P(),
-                out_specs=P(),
+                in_specs=tokens,
+                out_specs=tokens,
                 check_vma=False,
             )(out)
         return out
@@ -535,29 +541,44 @@ class Glm5NextDecoderLayer(JaxModule):
         with jax.named_scope(ffn):
             h = self.post_attention_layernorm(h)
             if ffn == "moe":
-                h = self.mlp(h, _num_valid_tokens(attention_metadata,
-                                                  self.mesh))
+                h = self.mlp(
+                    h,
+                    _num_valid_tokens(attention_metadata, self.mesh,
+                                      h.shape[0]))
             else:
                 h = self.mlp(h)
         with jax.named_scope("mhc"):
             return kv_cache, mhc.mhc_post(h, streams, post, comb, **kw)
 
 
-def _num_valid_tokens(attention_metadata, mesh: Mesh) -> Optional[jax.Array]:
-    """Number of real (unpadded) tokens in the step, or None under attention
-    DP, where each rank's padding is interleaved with the next rank's tokens.
+def _num_valid_tokens(attention_metadata,
+                      mesh: Mesh,
+                      num_tokens: Optional[int] = None) -> Optional[jax.Array]:
+    """The step's real (unpadded) tokens: their count (a scalar), or under DP
+    (attention DP or in-mesh data parallelism) a [num_tokens] bool mask, since
+    each rank's padding sits between its tokens and the next rank's.
 
     The runner pads a step to a token bucket (at least 16 tokens), and the
     padding rows would otherwise route to arbitrary experts: at batch 1 that is
     up to 16x the expert weights a decode step has to read."""
     if isinstance(attention_metadata, tuple):  # MLA: (latent, indexer tail)
         attention_metadata = attention_metadata[0]
-    if get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA) > 1:
-        return None
     qsl = attention_metadata.query_start_loc
-    # the runner repeats the end offset past the last request; max() also
-    # covers zero padding
-    return None if qsl is None else jnp.max(qsl)
+    if qsl is None:
+        return None
+    ranks = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_DATA)
+    if ranks == 1:
+        # the runner repeats the end offset past the last request; max() also
+        # covers zero padding
+        return jnp.max(qsl)
+    if num_tokens is None or num_tokens % ranks or qsl.shape[0] % ranks:
+        return None
+    # one equally padded token segment and one query_start_loc segment (local
+    # offsets, the end offset repeated) per rank
+    per_rank = num_tokens // ranks
+    counts = jnp.max(qsl.reshape(ranks, -1), axis=1)
+    t = jnp.arange(num_tokens)
+    return (t % per_rank) < counts[t // per_rank]
 
 
 class Glm5NextModel(JaxModule):

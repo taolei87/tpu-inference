@@ -477,8 +477,9 @@ class JaxRoutedExperts(JaxModule):
     ) -> tuple[jax.Array, Optional[jax.Array]]:
         """`e_score_correction_bias` [E] (DeepSeek-style noaux_tc routing):
         experts are chosen by score + bias, weighted by the unbiased score.
-        `num_valid_tokens` (scalar): tokens past it are padding and are routed
-        to expert 0 with weight 0, so they don't activate other experts.
+        `num_valid_tokens` (scalar, or a [T] bool mask of the real tokens):
+        tokens past it (or outside the mask) are padding and are routed to
+        expert 0 with weight 0, so they don't activate other experts.
         `defer_all_reduce`: return per-shard partial sums (the caller
         reduces them, e.g. together with a shared expert's).
         All three are supported by the GMM backends."""

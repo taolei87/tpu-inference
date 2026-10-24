@@ -1057,7 +1057,9 @@ def fused_moe_func(
     # concurrency), where padding tokens may activate unnecessary expert weights
     # and slow down the gmm kernel.
     if num_valid_tokens is not None:
-        token_valid = (jnp.arange(num_tokens) < num_valid_tokens)[:, None]
+        # a count of leading real tokens, or a [num_tokens] mask of them
+        token_valid = (num_valid_tokens if num_valid_tokens.ndim else
+                       jnp.arange(num_tokens) < num_valid_tokens)[:, None]
         topk_indices = jnp.where(token_valid, topk_indices, 0)
         topk_weights = jnp.where(token_valid, topk_weights, 0.0)
     # All gathering topk_indices and topk_weights if attention dp is used.

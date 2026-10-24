@@ -100,11 +100,14 @@ def _vllm_config(model_dir, dtype="float32"):
     )
 
 
-def _build(model_dir, tp=1, dtype="float32", attn_dp=1):
+def _build(model_dir, tp=1, dtype="float32", attn_dp=1, data=1):
     """The registered model class, built and loaded the way model_loader
-    does (abstract mesh context, then load_weights over the checkpoint)."""
-    if len(jax.devices()) < tp * attn_dp:
-        pytest.skip(f"needs {tp * attn_dp} devices")
+    does (abstract mesh context, then load_weights over the checkpoint).
+    `data` is in-mesh data parallelism (whole-model replicas), `attn_dp`
+    attention DP (the experts span the ranks)."""
+    n = tp * attn_dp * data
+    if len(jax.devices()) < n:
+        pytest.skip(f"needs {n} devices")
     vllm_config = _vllm_config(model_dir, dtype)
     from tpu_inference.layers.jax.quantization import \
         get_tpu_quantization_config
@@ -114,8 +117,8 @@ def _build(model_dir, tp=1, dtype="float32", attn_dp=1):
     vllm_config.model_config.dtype = to_jax_dtype(
         vllm_config.model_config.dtype)
     mesh = Mesh(
-        np.array(jax.devices()[:tp * attn_dp]).reshape(1, attn_dp, 1, 1, tp, 1,
-                                                       1), MESH_AXIS_NAMES)
+        np.array(jax.devices()[:n]).reshape(data, attn_dp, 1, 1, tp, 1, 1),
+        MESH_AXIS_NAMES)
     with set_current_vllm_config(vllm_config), jax.set_mesh(mesh):
         model = Glm5NextForConditionalGeneration(vllm_config,
                                                  jax.random.key(0), mesh)
@@ -219,8 +222,8 @@ class _DPCaches:
     ATTN_DATA-sharded caches, with the runner's packed metadata layout (one
     equally padded segment of tokens and of every metadata field per rank)."""
 
-    def __init__(self, text, ranks):
-        self.ranks = [_Caches(text, seed=r) for r in range(ranks)]
+    def __init__(self, text, ranks, dtype=jnp.float32):
+        self.ranks = [_Caches(text, dtype=dtype, seed=r) for r in range(ranks)]
         self.index = self.ranks[0].index
         self.kv_caches = jax.tree.map(lambda *a: jnp.concatenate(a),
                                       *[c.kv_caches for c in self.ranks])
@@ -296,27 +299,50 @@ def test_model_matches_reference_over_two_steps(tiny_dir, tp):
         assert _rel(logits, ref[rid][1]) < 1e-4, rid
 
 
-def test_model_matches_reference_with_attention_dp(tmp_path):
-    """Two attention-DP ranks, each with its own requests, rank-local pages
+@pytest.mark.parametrize(
+    "dp", [
+        dict(attn_dp=2),
+        dict(data=2),
+        dict(data=2, tp=2),
+        dict(data=2, attn_dp=2),
+    ],
+    ids=["attn_dp2", "data2", "data2_tp2", "data2_attn_dp2"])
+def test_model_matches_reference_with_attention_dp(tmp_path, dp):
+    """Two (or four) DP ranks, each with its own requests, rank-local pages
     and slots, over three steps (decodes first, chunked prefill remainders),
     in the sparse regime (index_topk 16) so the pooled keys and the tails
-    carried across steps decide each query's tokens."""
+    carried across steps decide each query's tokens. Attention DP (`attn_dp`)
+    and in-mesh data parallelism (`data`) pack the ranks the same way."""
     d = str(tmp_path)
     MT.write_tiny_checkpoint(d, seed=23, index_topk=16)
-    vllm_config, model, mesh = _build(d, attn_dp=2)
+    vllm_config, model, mesh = _build(d, **dp)
+    ranks = dp.get("attn_dp", 1) * dp.get("data", 1)
     text = vllm_config.model_config.hf_text_config
     rng = np.random.default_rng(4)
-    lens = {(0, 0): 37, (0, 1): 9, (1, 0): 30, (1, 1): 34}
+    # two request patterns, alternating over the ranks: (local id, length)
+    # and each step's (local id, first position, num tokens)
+    pattern = [
+        ({
+            0: 37,
+            1: 9
+        }, [[(0, 0, 13), (1, 0, 7)], [(1, 7, 1), (0, 13, 15)],
+            [(1, 8, 1), (0, 28, 9)]]),
+        ({
+            0: 30,
+            1: 34
+        }, [[(0, 0, 18), (1, 0, 9)], [(1, 9, 14), (0, 18, 11)],
+            [(0, 29, 1), (1, 23, 11)]]),
+    ]
+    lens = {
+        (r, i): n
+        for r in range(ranks)
+        for i, n in pattern[r % 2][0].items()
+    }
     ids = {g: rng.integers(0, text.vocab_size, n) for g, n in lens.items()}
     ref = _reference(d, ids, sparse="always")
-    caches = _DPCaches(text, 2)
-    steps = [
-        [[((0, 0), 0, 13), ((0, 1), 0, 7)], [((1, 0), 0, 18), ((1, 1), 0, 9)]],
-        [[((0, 1), 7, 1), ((0, 0), 13, 15)], [((1, 1), 9, 14),
-                                              ((1, 0), 18, 11)]],
-        [[((0, 1), 8, 1), ((0, 0), 28, 9)], [((1, 0), 29, 1),
-                                             ((1, 1), 23, 11)]],
-    ]
+    caches = _DPCaches(text, ranks)
+    steps = [[[((r, i), p0, n) for i, p0, n in pattern[r % 2][1][k]]
+              for r in range(ranks)] for k in range(3)]
     outs = [caches.run(model, mesh, st, ids) for st in steps]
     for g in ids:
         parts = [o[g] for o in outs if g in o]
@@ -403,8 +429,8 @@ def test_sparse_model_matches_reference(tmp_path):
 
 def test_num_valid_tokens_for_moe_padding():
     """The MoE routes the step's padding rows to expert 0, from the token
-    count in query_start_loc; attention DP (rank-interleaved padding) opts
-    out."""
+    count in query_start_loc; under DP (one padded segment per rank) from a
+    per-token mask of each rank's real tokens."""
     from tpu_inference.models.jax.glm5_next import _num_valid_tokens
     md = AttentionMetadata(input_positions=jnp.zeros(16, jnp.int32),
                            query_start_loc=jnp.asarray([0, 3, 5, 5, 5]))
@@ -413,8 +439,15 @@ def test_num_valid_tokens_for_moe_padding():
     assert int(_num_valid_tokens(md, mesh)) == 5
     assert int(_num_valid_tokens((md, md), mesh)) == 5  # MLA: (latent, tail)
     if len(devs) >= 2:
-        dp = Mesh(devs[:2].reshape(1, 2, 1, 1, 1, 1, 1), MESH_AXIS_NAMES)
-        assert _num_valid_tokens(md, dp) is None
+        # two ranks of 8 tokens: 3 real tokens on rank 0, 8 on rank 1
+        md2 = AttentionMetadata(input_positions=jnp.zeros(16, jnp.int32),
+                                query_start_loc=jnp.asarray(
+                                    [0, 1, 3, 3, 0, 8, 8, 8]))
+        want = np.r_[[True] * 3, [False] * 5, [True] * 8]
+        for shape in ((1, 2, 1, 1, 1, 1, 1), (2, 1, 1, 1, 1, 1, 1)):
+            dp = Mesh(devs[:2].reshape(shape), MESH_AXIS_NAMES)
+            np.testing.assert_array_equal(_num_valid_tokens(md2, dp, 16), want)
+            assert _num_valid_tokens(md2, dp) is None  # token count unknown
 
 
 def test_fp8_fused_expert_all_reduce(tmp_path):
@@ -444,6 +477,47 @@ def test_fp8_fused_expert_all_reduce(tmp_path):
     print("FUSEDREDUCE", e_fused, e_split, _rel(fused[0][0], split[0][0]))
     # bf16 rounding of the partial sums: as close to the f32 reference
     assert e_fused < 1.1 * e_split + 1e-3, (e_fused, e_split)
+
+
+def test_fp8_fused_expert_all_reduce_with_data_parallel(tmp_path):
+    """In-mesh data parallelism keeps the fused routed + shared all-reduce
+    (over each data group's TP axis) and the per-rank padding mask, and
+    matches the reference; attention DP drops the fused reduce."""
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=22, fp8=True)
+    vllm_config, model, mesh = _build(d, tp=2, data=2, dtype="bfloat16")
+    text = vllm_config.model_config.hf_text_config
+    moes = [
+        layer.mlp for layer in model.model.layers
+        if type(layer.mlp).__name__ == "Glm5NextMoE"
+    ]
+    assert moes and all(m.reduce_axes == ("model", ) for m in moes)
+    rng = np.random.default_rng(3)
+    ids = {
+        (r, 0): rng.integers(0, text.vocab_size, n)
+        for r, n in ((0, 12), (1, 5))
+    }
+    with jax.default_matmul_precision("default"):
+        caches = _DPCaches(text, 2, dtype=jnp.bfloat16)
+        out = caches.run(model, mesh, [[((0, 0), 0, 12)], [((1, 0), 0, 5)]],
+                         ids)
+    ref = _reference(d, ids)
+    # the same requests on one TP=2 replica: bf16 rounding sets the error
+    _, single, smesh = _build(d, tp=2, dtype="bfloat16")
+    with jax.default_matmul_precision("default"):
+        one = {
+            g:
+            _run(single, smesh, _Caches(text, dtype=jnp.bfloat16),
+                 [(0, 0, len(ids[g]))], {0: ids[g]})[0]
+            for g in ids
+        }
+    for g in ids:
+        e_dp, e_one = _rel(out[g][0], ref[g][0]), _rel(one[g][0], ref[g][0])
+        print("DPFUSED", g, e_dp, e_one, _rel(out[g][0], one[g][0]))
+        assert e_dp < 1.1 * e_one + 1e-3, (g, e_dp, e_one)
+    _, model2, _ = _build(d, tp=2, attn_dp=2, dtype="bfloat16")
+    assert not any(layer.mlp.reduce_axes for layer in model2.model.layers
+                   if type(layer.mlp).__name__ == "Glm5NextMoE")
 
 
 def test_moe_token_splits(tiny_dir, monkeypatch):
