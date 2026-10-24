@@ -175,9 +175,17 @@ class Glm5NextMoE(JaxModule):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.gate = Glm5NextRouter(config.hidden_size, config.n_routed_experts,
                                    rng)
+        # Under expert parallelism the expert axis must divide the EP size
+        # (288 doesn't divide 128 or 256): pad it with zero experts, which the
+        # routing never picks (see __call__).
+        E = config.n_routed_experts
+        ep = (get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
+              if JaxRoutedExperts._compute_use_ep() else 1)
+        self.num_pad_experts = -(-E // ep) * ep - E
         self.experts = JaxRoutedExperts(
             dtype=dtype,
-            num_local_experts=config.n_routed_experts,
+            num_local_experts=E,
+            num_padded_experts=E + self.num_pad_experts,
             hidden_size=config.hidden_size,
             intermediate_size_moe=config.moe_intermediate_size,
             hidden_act="silu",
@@ -210,6 +218,14 @@ class Glm5NextMoE(JaxModule):
                  x: jax.Array,
                  num_valid_tokens: Optional[jax.Array] = None) -> jax.Array:
         logits = self.gate(x)
+        bias = self.gate.e_score_correction_bias[...]
+        if self.num_pad_experts:
+            # padded experts: sigmoid score 0 and a -1e30 bias, so they never
+            # make the top-k
+            logits = jnp.pad(logits, ((0, 0), (0, self.num_pad_experts)),
+                             constant_values=-1e9)
+            bias = jnp.pad(bias, (0, self.num_pad_experts),
+                           constant_values=-1e30)
         # GLM5_MOE_TOKEN_SPLITS > 1 runs a prefill-sized step's routed experts
         # as that many independent token slices, so one slice's SparseCore
         # combine can overlap the next one's GMMs on the TensorCore.
@@ -223,12 +239,11 @@ class Glm5NextMoE(JaxModule):
             if nv is not None and n > 1:
                 nv = (nv[lo:lo +
                          T // n] if nv.ndim else jnp.clip(nv - lo, 0, T // n))
-            routed, _ = self.experts(
-                x[lo:lo + T // n],
-                logits[lo:lo + T // n],
-                e_score_correction_bias=self.gate.e_score_correction_bias[...],
-                num_valid_tokens=nv,
-                defer_all_reduce=bool(self.reduce_axes))
+            routed, _ = self.experts(x[lo:lo + T // n],
+                                     logits[lo:lo + T // n],
+                                     e_score_correction_bias=bias,
+                                     num_valid_tokens=nv,
+                                     defer_all_reduce=bool(self.reduce_axes))
             parts.append(routed)
         routed = jnp.concatenate(parts) if n > 1 else parts[0]
         out = (routed * self.routed_scaling_factor).astype(

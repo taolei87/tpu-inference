@@ -342,6 +342,16 @@ class JaxMoE(JaxModule):
         return loaded_names
 
 
+def concat_experts(slots, num_experts: Optional[int] = None) -> jax.Array:
+    """The per-expert arrays [1, ...] stacked on the expert axis, padded with
+    zero experts to `num_experts`."""
+    x = jnp.concatenate(slots, axis=0)
+    pad = (num_experts or x.shape[0]) - x.shape[0]
+    if pad > 0:
+        x = jnp.pad(x, ((0, pad), ) + ((0, 0), ) * (x.ndim - 1))
+    return x
+
+
 class JaxRoutedExperts(JaxModule):
     """Expert-only MoE module analogous to vllm's RoutedExperts.
 
@@ -372,9 +382,17 @@ class JaxRoutedExperts(JaxModule):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_return_routed_experts: bool = False,
+        num_padded_experts: Optional[int] = None,
     ):
+        """`num_padded_experts` (>= num_local_experts): the expert axis of
+        the weights, padded with zero experts so it divides the expert-parallel
+        size. The checkpoint's `num_local_experts` are loaded as usual; the
+        caller keeps the padded ones out of the routing (their router logits
+        and score bias at -inf)."""
         self.dtype = dtype
         self.num_local_experts = num_local_experts
+        self.num_padded_experts = num_padded_experts or num_local_experts
+        assert self.num_padded_experts >= num_local_experts
         self.hidden_size = hidden_size
         self.intermediate_size_moe = intermediate_size_moe
         self.hidden_act = hidden_act
@@ -390,6 +408,7 @@ class JaxRoutedExperts(JaxModule):
         E = num_local_experts
         D = hidden_size
         F = intermediate_size_moe
+        E_pad = self.num_padded_experts
 
         # Assign the final loading layout up front. Otherwise each full expert
         # tensor is temporarily replicated on every device before the quant
@@ -399,19 +418,19 @@ class JaxRoutedExperts(JaxModule):
             mesh, self.use_ep)
 
         self.kernel_gating_EDF = create_param(rngs,
-                                              shape=(E, D, F),
+                                              shape=(E_pad, D, F),
                                               dtype=dtype,
                                               sharding=edf_sharding,
                                               random_init=random_init)
         self.kernel_gating_EDF.set_metadata(_weights_to_load=[None] * E)
         self.kernel_up_proj_EDF = create_param(rngs,
-                                               shape=(E, D, F),
+                                               shape=(E_pad, D, F),
                                                dtype=dtype,
                                                sharding=edf_sharding,
                                                random_init=random_init)
         self.kernel_up_proj_EDF.set_metadata(_weights_to_load=[None] * E)
         self.kernel_down_proj_EFD = create_param(rngs,
-                                                 shape=(E, F, D),
+                                                 shape=(E_pad, F, D),
                                                  dtype=dtype,
                                                  sharding=efd_sharding,
                                                  random_init=random_init)
@@ -550,8 +569,8 @@ class JaxRoutedExperts(JaxModule):
         }.items():
             if all(w is not None for w in param._weights_to_load):
                 with cpu_mesh_context():
-                    concatenated = jnp.concatenate(param._weights_to_load,
-                                                   axis=0)
+                    concatenated = concat_experts(param._weights_to_load,
+                                                  self.num_padded_experts)
                 param.value = shard_put(concatenated, param.out_sharding, mesh)
                 loaded_names.add(name)
         return loaded_names

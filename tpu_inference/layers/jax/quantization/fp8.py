@@ -572,8 +572,12 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                                             device=jax.devices('cpu')[0])
                     setattr(
                         layer, f"{param_name}_{self.weight_scale_name}",
-                        nnx.Param(scale_value,
-                                  _weights_to_load=[None for _ in range(E)]))
+                        nnx.Param(
+                            scale_value,
+                            _weights_to_load=[
+                                None for _ in range(
+                                    getattr(layer, "num_local_experts", E))
+                            ]))
             else:
                 assert len(
                     self.weight_block_size
@@ -600,8 +604,12 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                                             device=jax.devices('cpu')[0])
                     setattr(
                         layer, f"{param_name}_{self.weight_scale_name}",
-                        nnx.Param(scale_value,
-                                  _weights_to_load=[None for _ in range(E)]))
+                        nnx.Param(
+                            scale_value,
+                            _weights_to_load=[
+                                None for _ in range(
+                                    getattr(layer, "num_local_experts", E))
+                            ]))
         else:
             raise NotImplementedError(
                 f"Unsupported moe backend: {layer.moe_backend}! Currently supported: {FP8_QUANT_METHOD_SUPPORTED_MOE_BACKENDS}"
@@ -636,22 +644,24 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 # more than once. We only want to process the weights once all of them are loaded.
                 return False
 
+            from tpu_inference.layers.jax.moe.moe import concat_experts
+
+            # padded with zero experts to the weights' expert axis (see
+            # JaxRoutedExperts.num_padded_experts)
+            E_pad = getattr(layer, "num_padded_experts", None)
             with cpu_mesh_context():
-                w_gate = jnp.concatenate(
-                    layer.kernel_gating_EDF._weights_to_load, axis=0)
-                w_up = jnp.concatenate(
-                    layer.kernel_up_proj_EDF._weights_to_load, axis=0)
-                s_gate = jnp.concatenate(getattr(
-                    layer, gating_scale_name)._weights_to_load,
-                                         axis=0)
-                s_up = jnp.concatenate(getattr(layer,
-                                               up_scale_name)._weights_to_load,
-                                       axis=0)
-                w2_weight = jnp.concatenate(
-                    layer.kernel_down_proj_EFD._weights_to_load, axis=0)
-                w2_weight_scale = jnp.concatenate(getattr(
-                    layer, down_scale_name)._weights_to_load,
-                                                  axis=0)
+                w_gate = concat_experts(
+                    layer.kernel_gating_EDF._weights_to_load, E_pad)
+                w_up = concat_experts(
+                    layer.kernel_up_proj_EDF._weights_to_load, E_pad)
+                s_gate = concat_experts(
+                    getattr(layer, gating_scale_name)._weights_to_load, E_pad)
+                s_up = concat_experts(
+                    getattr(layer, up_scale_name)._weights_to_load, E_pad)
+                w2_weight = concat_experts(
+                    layer.kernel_down_proj_EFD._weights_to_load, E_pad)
+                w2_weight_scale = concat_experts(
+                    getattr(layer, down_scale_name)._weights_to_load, E_pad)
 
                 # Fuse the weights into w13: [Gate, Up]. w2 is expected to be
                 # (num_experts, hidden_size, intermediate_size), w13 is expected to

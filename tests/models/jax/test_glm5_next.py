@@ -85,7 +85,7 @@ def _rel(a, b):
     return float(np.abs(a - b).max() / max(np.abs(b).max(), 1e-30))
 
 
-def _vllm_config(model_dir, dtype="float32"):
+def _vllm_config(model_dir, dtype="float32", ep_devices=0):
     return VllmConfig(
         model_config=ModelConfig(model=model_dir,
                                  skip_tokenizer_init=True,
@@ -95,20 +95,23 @@ def _vllm_config(model_dir, dtype="float32"):
         scheduler_config=SchedulerConfig(max_num_seqs=MAX_REQS,
                                          max_model_len=PAGE * PAGES_PER_SEQ,
                                          is_encoder_decoder=False),
-        parallel_config=ParallelConfig(),
+        parallel_config=ParallelConfig(tensor_parallel_size=ep_devices,
+                                       enable_expert_parallel=True)
+        if ep_devices else ParallelConfig(),
         additional_config=_GLM_ADDITIONAL_CONFIG,
     )
 
 
-def _build(model_dir, tp=1, dtype="float32", attn_dp=1, data=1):
+def _build(model_dir, tp=1, dtype="float32", attn_dp=1, data=1, ep=False):
     """The registered model class, built and loaded the way model_loader
     does (abstract mesh context, then load_weights over the checkpoint).
     `data` is in-mesh data parallelism (whole-model replicas), `attn_dp`
-    attention DP (the experts span the ranks)."""
+    attention DP (the experts span the ranks); `ep` shards the experts whole
+    over the mesh (GMM_EP) instead of tensor-parallel."""
     n = tp * attn_dp * data
     if len(jax.devices()) < n:
         pytest.skip(f"needs {n} devices")
-    vllm_config = _vllm_config(model_dir, dtype)
+    vllm_config = _vllm_config(model_dir, dtype, ep_devices=n if ep else 0)
     from tpu_inference.layers.jax.quantization import \
         get_tpu_quantization_config
     vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
@@ -351,6 +354,54 @@ def test_model_matches_reference_with_attention_dp(tmp_path, dp):
         assert h.shape[0] == lens[g], g
         assert _rel(h, ref[g][0]) < 1e-4, g
         assert _rel(logits, ref[g][1]) < 1e-4, g
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["f32", "fp8"])
+def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, monkeypatch):
+    """Attention DP (2 ranks of TP=2) with the experts sharded whole over all
+    4 devices (GMM_EP): 6 experts are padded to 8 with zero experts that the
+    routing never picks; the output matches the reference (f32) or one TP=2
+    replica (fp8)."""
+    if jax.default_backend() != "tpu":
+        # the EP token permutes as one-hot matmuls (the SparseCore gathers
+        # are TPU-only)
+        monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "1000000")
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=24, fp8=fp8, n_routed_experts=6)
+    dtype = "bfloat16" if fp8 else "float32"
+    vllm_config, model, mesh = _build(d, tp=2, attn_dp=2, ep=True, dtype=dtype)
+    from tpu_inference.layers.common.moe import MoEBackend
+    moes = [
+        layer.mlp for layer in model.model.layers
+        if type(layer.mlp).__name__ == "Glm5NextMoE"
+    ]
+    assert moes and all(m.num_pad_experts == 2 for m in moes)
+    assert all(m.experts.moe_backend == MoEBackend.GMM_EP for m in moes)
+    assert all(m.experts.kernel_down_proj_EFD[...].shape[0] == 8 for m in moes)
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(5)
+    lens = {(0, 0): 21, (0, 1): 3, (1, 0): 16}
+    ids = {g: rng.integers(0, text.vocab_size, n) for g, n in lens.items()}
+    jdt = jnp.bfloat16 if fp8 else jnp.float32
+    steps = [[[((0, 0), 0, 13), ((0, 1), 0, 3)], [((1, 0), 0, 14)]],
+             [[((0, 0), 13, 8)], [((1, 0), 14, 2)]]]
+    with jax.default_matmul_precision("default" if fp8 else "highest"):
+        caches = _DPCaches(text, 2, dtype=jdt)
+        outs = [caches.run(model, mesh, st, ids) for st in steps]
+    got = {g: np.concatenate([o[g][0] for o in outs if g in o]) for g in ids}
+    ref = _reference(d, ids)
+    if not fp8:
+        for g in ids:
+            assert _rel(got[g], ref[g][0]) < 1e-4, g
+        return
+    _, single, smesh = _build(d, tp=2, dtype=dtype)
+    with jax.default_matmul_precision("default"):
+        for g in ids:
+            one = _run(single, smesh, _Caches(text, dtype=jdt),
+                       [(0, 0, lens[g])], {0: ids[g]})[0][0]
+            e_ep, e_one = _rel(got[g], ref[g][0]), _rel(one, ref[g][0])
+            print("WIDEEP", g, e_ep, e_one)
+            assert e_ep < 1.2 * e_one + 2e-3, (g, e_ep, e_one)
 
 
 def test_registry(tiny_dir):
