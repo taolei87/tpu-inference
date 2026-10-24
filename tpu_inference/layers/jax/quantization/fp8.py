@@ -469,7 +469,13 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
     def __init__(self, weight_block_size: Optional[Sequence[int]], *args,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        self.extra_backend_kwargs = {}
+        # VLLM_MOE_CHUNK_SIZE: run the GMMs and the combine over token chunks
+        # (as FusedMoEMethodBase does); bounds the SparseCore gather-reduce of
+        # a large expert-parallel step
+        from tpu_inference import envs
+        self.extra_backend_kwargs = ({
+            "moe_chunk_size": envs.VLLM_MOE_CHUNK_SIZE
+        } if envs.VLLM_MOE_CHUNK_SIZE else {})
         self.weight_block_size = None if weight_block_size is None else tuple(
             weight_block_size)
         self.block_quant: bool = self.weight_block_size is not None
