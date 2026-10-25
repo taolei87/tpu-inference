@@ -271,7 +271,11 @@ def get_glm5_next_kv_cache_spec(
         # attention DP: size the pool per chip (see attn_dp_num_blocks)
         hbm = common_utils.hbm_usage_bytes(runner.mesh.devices.flatten())
         util = cache_config.gpu_memory_utilization
-        free = min(int(limit * util - used) for used, limit in hbm)
+        # less a reserve for decode-step temporaries: the profile run (one
+        # prefill chunk per rank) doesn't cover a large decode batch (18-24
+        # 64k requests per rank needed ~0.7-0.9 GB more on a v6e-128)
+        free = min(int(limit * util - used) for used, limit in hbm) - int(
+            envs.GLM5_ATTN_DP_RESERVE_GIB * 2**30)
         blocks = attn_dp_num_blocks(
             free, ranks,
             common_utils.get_mesh_shape_product(runner.mesh,

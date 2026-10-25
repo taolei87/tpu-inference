@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     DP_SCHED_ROUTING: str = "least_loaded"
     VLLM_MOE_CHUNK_SIZE: int = 0
     GLM5_ATTN_DP_BLOCKS: bool = True
+    GLM5_ATTN_DP_RESERVE_GIB: float = 2.0
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     PROFILE_SINGLE_DEVICE: bool = False
     LORA_MODULE_PATH: str = ""
@@ -505,6 +506,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the planner's all-device byte totals.
     "GLM5_ATTN_DP_BLOCKS":
     env_bool("GLM5_ATTN_DP_BLOCKS", default=True),
+    # Per-chip HBM (GiB) the GLM attention-DP block sizing leaves for
+    # decode-step temporaries.
+    "GLM5_ATTN_DP_RESERVE_GIB":
+    lambda: float(os.getenv("GLM5_ATTN_DP_RESERVE_GIB", "2.0")),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
