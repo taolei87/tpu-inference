@@ -278,7 +278,9 @@ def get_glm5_next_kv_cache_spec(
                                                 ShardingAxisName.ATTN_HEAD),
             n_mla, attn_page, n_kda, kda_page, tail_page,
             manager._mamba_num_blocks)
-        if blocks > (cache_config.num_gpu_blocks_override or 0):
+        if blocks > 0:
+            # (The compact-mamba sizing above leaves its own all-device count
+            # in num_gpu_blocks_override; it overcounts, and only caps.)
             # The engine core plans the pool from the memory this worker
             # reports (determine_available_memory), at its bytes per block:
             # the largest uniform-page group's layers x the uniform page.
