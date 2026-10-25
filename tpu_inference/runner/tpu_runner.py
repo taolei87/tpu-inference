@@ -3015,7 +3015,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                                   dp_size),
                     max_num_reqs_per_dp_rank=max_num_reqs_per_dp_rank,
                 ))
-            logits_indices_view[:] = spec_decode_metadata.final_logits_indices
+            logits_indices_view[:] = getattr(
+                spec_decode_metadata, "final_logits_indices_cpu",
+                spec_decode_metadata.final_logits_indices)
 
         # Put to device
         sampling_metadata = TPUSupportedSamplingMetadata.from_input_batch(

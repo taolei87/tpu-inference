@@ -312,6 +312,11 @@ class TestSpeculativeDecodingManager:
             padded_len - len(expected_logits_indices))
         assert np.asarray(metadata.final_logits_indices).tolist(
         ) == expected_padded_logits_indices
+        # the host copy the runner fills its logits-index buffer from (the
+        # device array can't be read back on a multi-host slice)
+        assert isinstance(metadata.final_logits_indices_cpu, np.ndarray)
+        assert metadata.final_logits_indices_cpu.tolist(
+        ) == expected_padded_logits_indices
 
         # bonus_logits_indices - compare as Python lists
         assert np.asarray(metadata.bonus_logits_indices).tolist(

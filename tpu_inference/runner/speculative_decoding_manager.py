@@ -418,6 +418,7 @@ class SpeculativeDecodingManager:
         padded_bonus_logits_indices = np.concatenate(out_bonus_logits_indices)
         padded_num_draft_tokens = np.concatenate(out_draft_lengths)
         padded_num_draft_tokens_cpu = padded_num_draft_tokens
+        padded_logits_indices_cpu = padded_logits_indices
         # CPU -> TPU copy.
         (padded_num_draft_tokens, padded_logits_indices,
          padded_target_logits_indices,
@@ -435,6 +436,10 @@ class SpeculativeDecodingManager:
             final_logits_indices=padded_logits_indices,
         )
         metadata.draft_lengths_cpu = padded_num_draft_tokens_cpu
+        # the runner copies these into its host logits-index buffer; the device
+        # array spans every host's devices, so it can't be read back on a
+        # multi-host slice
+        metadata.final_logits_indices_cpu = padded_logits_indices_cpu
         metadata.req_indices_dp = req_indices_dp
         metadata.req_ids_dp = req_ids_dp
         return metadata
