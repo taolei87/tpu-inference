@@ -327,3 +327,23 @@ def test_specs_with_mtp_speculative_decoding(tiny_dir, monkeypatch):
                                                          lay.tail_shape[1]), )
     assert specs[G.layer_name(lay.kda_layers[0])].num_speculative_blocks == 3
     assert len({s.page_size_bytes for s in specs.values()}) == 1
+
+
+def test_attn_dp_num_blocks_from_the_tightest_chip():
+    """Attention DP sizes the block pool per chip: each rank's pages are on
+    every chip of its group, its KDA states split over the head shards. The
+    v6e-128 numbers (32 ranks of TP=4, 18.8 GiB free per chip, 800 KDA slots)
+    give ~1,570 blocks per rank, against the planner's 397."""
+    MB = 1 << 20
+    kda = 4_342_784  # one KDA layer's conv + recurrent state, all heads
+    attn = 1_114_112  # latent 1 MiB + pooled keys 64 KiB per 1024-token block
+    blocks = G.attn_dp_num_blocks(int(18.8 * 1024 * MB), 32, 4, 11, attn, 34,
+                                  kda, 4096, 800)
+    assert blocks % 32 == 0
+    per_rank = blocks // 32
+    assert 1500 < per_rank < 1600, per_rank
+    # what each chip holds: its rank's pages plus its share of the slots
+    held = per_rank * 11 * attn + 25 * (34 * kda // 4 + 11 * 4096)
+    assert held <= int(18.8 * 1024 * MB)
+    # no room for the slots leaves no blocks, not a negative count
+    assert G.attn_dp_num_blocks(MB, 32, 4, 11, attn, 34, kda, 4096, 800) == 0

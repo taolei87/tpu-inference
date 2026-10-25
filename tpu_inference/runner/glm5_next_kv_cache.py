@@ -57,6 +57,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, MambaSpec
 
+from tpu_inference import envs
 from tpu_inference import utils as common_utils
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.common.sparse_mla_indexer import tail_ring
@@ -167,6 +168,22 @@ def vllm_num_groups_per_type(type_counts: list[int]) -> list[int]:
     return [cdiv(c, group_size) for c in type_counts]
 
 
+def attn_dp_num_blocks(free_per_chip: int, ranks: int, head_shards: int,
+                       n_mla: int, attn_page: int, n_kda: int, kda_page: int,
+                       tail_page: int, mamba_blocks: int) -> int:
+    """Attention blocks (summed over the attention-DP ranks) that fit the
+    tightest chip, from each chip's real share: a rank's latent and pooled-key
+    pages are on every chip of its group (`attn_page` per block per MLA
+    layer), its KDA states are split over the head shards and its indexer
+    tails are whole. The block planner counts bytes summed over all devices
+    instead, which undersizes the pool when the groups are small (TP=4 groups
+    on a v6e-128: 397 blocks per rank where ~1,500 fit)."""
+    per_rank_slots = -(-mamba_blocks // ranks)
+    slot_bytes = n_kda * kda_page // head_shards + n_mla * tail_page
+    room = free_per_chip - per_rank_slots * slot_bytes
+    return max(room // (n_mla * attn_page), 0) * ranks
+
+
 def _model_dtype(runner) -> torch.dtype:
     dtype = runner.model_config.dtype
     return dtype if isinstance(dtype, torch.dtype) else torch.bfloat16
@@ -241,11 +258,33 @@ def get_glm5_next_kv_cache_spec(
         n_kda, kda_page, n_mla, tail_page, uniform)
     # Attention gets the HBM the compact mamba pool leaves; the sizing works
     # on totals, so pass them as one "layer" each.
+    pinned = cache_config.num_gpu_blocks_override
     manager._maybe_set_compact_mamba_num_blocks_override(
         attn_page_size_bytes=n_mla * attn_page,
         unpadded_mamba_page_size_bytes=n_kda * kda_page + n_mla * tail_page,
         num_attn_layers=1,
         num_mamba_layers=1)
+    ranks = common_utils.get_mesh_shape_product(runner.mesh,
+                                                ShardingAxisName.ATTN_DATA)
+    if (pinned is None and ranks > 1 and manager._mamba_num_blocks is not None
+            and envs.GLM5_ATTN_DP_BLOCKS):
+        # attention DP: size the pool per chip (see attn_dp_num_blocks)
+        hbm = common_utils.hbm_usage_bytes(runner.mesh.devices.flatten())
+        util = cache_config.gpu_memory_utilization
+        free = min(int(limit * util - used) for used, limit in hbm)
+        blocks = attn_dp_num_blocks(
+            free, ranks,
+            common_utils.get_mesh_shape_product(runner.mesh,
+                                                ShardingAxisName.ATTN_HEAD),
+            n_mla, attn_page, n_kda, kda_page, tail_page,
+            manager._mamba_num_blocks)
+        if blocks > (cache_config.num_gpu_blocks_override or 0):
+            logger.info(
+                "GLM-5.3-Flash attention DP: %d attention blocks (%d per "
+                "rank) from the tightest chip's %.2f GiB, instead of %s.",
+                blocks, blocks // ranks, free / 2**30,
+                cache_config.num_gpu_blocks_override)
+            cache_config.num_gpu_blocks_override = int(blocks)
 
     mamba_common = dict(block_size=cache_config.mamba_block_size or block_size,
                         page_size_padded=int(uniform),

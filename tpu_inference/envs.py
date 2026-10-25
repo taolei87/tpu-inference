@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
     DP_SCHED_ROUTING: str = "least_loaded"
     VLLM_MOE_CHUNK_SIZE: int = 0
+    GLM5_ATTN_DP_BLOCKS: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     PROFILE_SINGLE_DEVICE: bool = False
     LORA_MODULE_PATH: str = ""
@@ -499,6 +500,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "VLLM_MOE_CHUNK_SIZE":
     lambda: int(os.getenv("VLLM_MOE_CHUNK_SIZE", "0")),
+    # GLM-5.3-Flash under attention DP: size the attention block pool from the
+    # tightest chip's real share (glm5_next_kv_cache.attn_dp_num_blocks)
+    # instead of the planner's all-device byte totals.
+    "GLM5_ATTN_DP_BLOCKS":
+    env_bool("GLM5_ATTN_DP_BLOCKS", default=True),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
