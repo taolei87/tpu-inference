@@ -567,6 +567,14 @@ class TPUWorker(WorkerBase):
                              f"{-total_hbm_avail_gb}GiB. Please consider "
                              f"increasing --gpu-memory-utilization from "
                              f"{gpu_memory_utilization} to a larger value.")
+        manager = getattr(self.model_runner, "kv_cache_manager", None)
+        override = getattr(manager, "available_memory_override", None)
+        if override:
+            logger.info(
+                "Reporting %.2f GiB to the KV block planner (the model's "
+                "per-chip sizing) instead of %.2f GiB.", override / 2**30,
+                total_hbm_avail / 2**30)
+            return override
         return total_hbm_avail
 
     def execute_model(

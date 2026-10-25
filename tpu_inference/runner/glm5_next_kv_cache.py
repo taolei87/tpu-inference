@@ -279,11 +279,21 @@ def get_glm5_next_kv_cache_spec(
             n_mla, attn_page, n_kda, kda_page, tail_page,
             manager._mamba_num_blocks)
         if blocks > (cache_config.num_gpu_blocks_override or 0):
+            # The engine core plans the pool from the memory this worker
+            # reports (determine_available_memory), at its bytes per block:
+            # the largest uniform-page group's layers x the uniform page.
+            # Report what makes that plan `blocks`; the worker-side override
+            # caps the allocation at it either way.
+            group = max(n_mla, n_kda) if max(
+                n_mla, n_kda) < 1.5 * min(n_mla, n_kda) else min(n_mla, n_kda)
+            manager.available_memory_override = int(blocks * group * uniform)
             logger.info(
                 "GLM-5.3-Flash attention DP: %d attention blocks (%d per "
-                "rank) from the tightest chip's %.2f GiB, instead of %s.",
-                blocks, blocks // ranks, free / 2**30,
-                cache_config.num_gpu_blocks_override)
+                "rank) from the tightest chip's %.2f GiB, instead of %s; "
+                "reporting %.2f GiB to the block planner.", blocks,
+                blocks // ranks, free / 2**30,
+                cache_config.num_gpu_blocks_override,
+                manager.available_memory_override / 2**30)
             cache_config.num_gpu_blocks_override = int(blocks)
 
     mamba_common = dict(block_size=cache_config.mamba_block_size or block_size,

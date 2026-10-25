@@ -96,6 +96,10 @@ class KVCacheManager:
         # on the TPU side (where we duplicate the shared tensor per layer
         # because mamba and attention caches have different shapes).
         self._hybrid_uniform_page_size_bytes: int | None = None
+        # Set by a model's spec builder to replace the memory the worker
+        # reports to the engine core's block planner (GLM-5.3-Flash under
+        # attention DP: glm5_next_kv_cache.attn_dp_num_blocks).
+        self.available_memory_override: int | None = None
         # Per-mamba-layer leading-dim cap for hybrid models. Mamba state is
         # recurrent (one slot per *active* request), so the `num_blocks`
         # slots vLLM hands out are mostly idle. Set by
