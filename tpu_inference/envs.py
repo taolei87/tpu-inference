@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     DP_SCHED_ROUTING: str = "least_loaded"
     VLLM_MOE_CHUNK_SIZE: int = 0
     GLM5_ATTN_DP_BLOCKS: bool = True
-    GLM5_ATTN_DP_RESERVE_GIB: float = 2.0
+    GLM5_ATTN_DP_RESERVE_GIB: float = 4.5
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
     PROFILE_SINGLE_DEVICE: bool = False
     LORA_MODULE_PATH: str = ""
@@ -507,9 +507,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "GLM5_ATTN_DP_BLOCKS":
     env_bool("GLM5_ATTN_DP_BLOCKS", default=True),
     # Per-chip HBM (GiB) the GLM attention-DP block sizing leaves for
-    # decode-step temporaries.
+    # decode-step temporaries and the loaded programs. On a v6e-128 (32 ranks
+    # of TP=4) 40,000 blocks ran 18 x 64k requests per rank, while 45,120
+    # (2 GiB) failed to load a program at 20 and ~50k (none) ran out at 18;
+    # 4.5 GiB gives ~38k.
     "GLM5_ATTN_DP_RESERVE_GIB":
-    lambda: float(os.getenv("GLM5_ATTN_DP_RESERVE_GIB", "2.0")),
+    lambda: float(os.getenv("GLM5_ATTN_DP_RESERVE_GIB", "4.5")),
     # Use Onehot+Matmul for permute and unpermute before and after moe
     # when the batch size <= this threshold. When set to 0, this feature
     # is effectively disabled.
