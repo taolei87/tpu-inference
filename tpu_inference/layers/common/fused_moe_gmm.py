@@ -412,6 +412,21 @@ def moe_gmm_local(x: jax.Array,
             out = _hierarchical_collect(chunk_hidden, *hierarchical_collect,
                                         reduce_axes,
                                         scatter_axes).astype(x.dtype)
+        elif (scatter_results and reduce_axes and scatter_axes
+              and envs.MOE_SCATTER_ONE_COLLECTIVE):
+            # One reduce-scatter over the ranks and the reduce axes (rank
+            # major: device (r, m) gets token slice r * n_reduce + m), then an
+            # all-gather of the rank's slices over the reduce axes: one
+            # rounding of the partial sums, about half an all-reduce's bytes.
+            out = jax.lax.psum_scatter(chunk_hidden,
+                                       axis_name=tuple(scatter_axes) +
+                                       tuple(reduce_axes),
+                                       scatter_dimension=0,
+                                       tiled=True)
+            out = jax.lax.all_gather(out,
+                                     axis_name=tuple(reduce_axes),
+                                     axis=0,
+                                     tiled=True).astype(x.dtype)
         elif scatter_results:
             if reduce_axes:
                 chunk_hidden = jax.lax.psum(chunk_hidden,

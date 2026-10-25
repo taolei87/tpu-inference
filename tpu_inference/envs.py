@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     MOE_HIERARCHICAL_DISPATCH: bool = False
     MOE_HIERARCHICAL_COLLECT: bool = False
     MOE_FOLD_ROUTING_INTO_DISPATCH: bool = False
+    MOE_SCATTER_ONE_COLLECTIVE: bool = False
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
     MOE_GATHER_REDUCE_ON_TC: bool = False
@@ -584,6 +585,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fused_moe_gmm.py.
     "MOE_FOLD_ROUTING_INTO_DISPATCH":
     env_bool("MOE_FOLD_ROUTING_INTO_DISPATCH", default=False),
+    # scatter_results with both reduce and scatter axes: one reduce-scatter
+    # over both, then an all-gather over the reduce axes, instead of a psum
+    # over the reduce axes followed by a reduce-scatter over the ranks (which
+    # rounds 16-bit partial sums twice). GLM-5.3-Flash under attention DP with
+    # expert parallelism then scatters its routed-expert outputs.
+    "MOE_SCATTER_ONE_COLLECTIVE":
+    env_bool("MOE_SCATTER_ONE_COLLECTIVE", default=False),
+
     # EP dispatch permute gather: the ragged_gather_v2 kernel
     # (kernels/sparse_core/ragged_gather_v2.py), called from fused_moe_gmm.py.
     # max_row_subchunks: caps the SparseCore gather's block size; 1 gives the

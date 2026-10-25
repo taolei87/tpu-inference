@@ -359,8 +359,14 @@ def test_model_matches_reference_with_attention_dp(tmp_path, dp):
         assert _rel(logits, ref[g][1]) < 1e-4, g
 
 
+# (scatter_results' default two-step reduction, a psum over the TP axes then a
+# reduce-scatter over the ranks, rounds the bf16 partial sums twice: 2x the
+# error here; GLM uses the one-collective form.)
+@pytest.mark.parametrize("scatter", ["", "one-collective"],
+                         ids=["allreduce", "scatter"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["f32", "fp8"])
-def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, monkeypatch):
+def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, scatter,
+                                                  monkeypatch):
     """Attention DP (2 ranks of TP=2) with the experts sharded whole over all
     4 devices (GMM_EP): 6 experts are padded to 8 with zero experts that the
     routing never picks; the output matches the reference (f32) or one TP=2
@@ -369,6 +375,9 @@ def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, monkeypatch):
         # the EP token permutes as one-hot matmuls (the SparseCore gathers
         # are TPU-only)
         monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "1000000")
+    # the routed output all-reduced to every rank, or reduce-scattered to the
+    # ranks' tokens in one collective
+    monkeypatch.setenv("MOE_SCATTER_ONE_COLLECTIVE", "1" if scatter else "0")
     d = str(tmp_path)
     MT.write_tiny_checkpoint(d, seed=24, fp8=fp8, n_routed_experts=6)
     dtype = "bfloat16" if fp8 else "float32"
@@ -381,6 +390,7 @@ def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, monkeypatch):
     assert moes and all(m.num_pad_experts == 2 for m in moes)
     assert all(m.experts.moe_backend == MoEBackend.GMM_EP for m in moes)
     assert all(m.experts.kernel_down_proj_EFD[...].shape[0] == 8 for m in moes)
+    assert all(m.scatter_results == bool(scatter) for m in moes)
     text = vllm_config.model_config.hf_text_config
     rng = np.random.default_rng(5)
     lens = {(0, 0): 21, (0, 1): 3, (1, 0): 16}
@@ -403,7 +413,7 @@ def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, monkeypatch):
             one = _run(single, smesh, _Caches(text, dtype=jdt),
                        [(0, 0, lens[g])], {0: ids[g]})[0][0]
             e_ep, e_one = _rel(got[g], ref[g][0]), _rel(one, ref[g][0])
-            print("WIDEEP", g, e_ep, e_one)
+            print("WIDEEP", scatter, g, e_ep, e_one)
             assert e_ep < 1.2 * e_one + 2e-3, (g, e_ep, e_one)
 
 

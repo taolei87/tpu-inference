@@ -41,7 +41,7 @@ from vllm.model_executor.models.utils import WeightsMapper
 
 import tpu_inference.envs as envs
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
-from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.common.sharding import (ShardingAxisName, is_attn_dp)
 from tpu_inference.layers.common.sparse_mla_indexer import run_sparse_mla_step
 from tpu_inference.layers.jax import JaxModule, mhc
 from tpu_inference.layers.jax.attention.kda import (KimiDeltaAttention,
@@ -182,6 +182,11 @@ class Glm5NextMoE(JaxModule):
         ep = (get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
               if JaxRoutedExperts._compute_use_ep() else 1)
         self.num_pad_experts = -(-E // ep) * ep - E
+        # attention DP with expert parallelism: each rank gets back only its
+        # tokens' expert outputs, reduce-scattered in one collective
+        # (MOE_SCATTER_ONE_COLLECTIVE) instead of all-reduced to every rank
+        self.scatter_results = (envs.MOE_SCATTER_ONE_COLLECTIVE and ep > 1
+                                and is_attn_dp(mesh))
         self.experts = JaxRoutedExperts(
             dtype=dtype,
             num_local_experts=E,
@@ -243,7 +248,8 @@ class Glm5NextMoE(JaxModule):
                                      logits[lo:lo + T // n],
                                      e_score_correction_bias=bias,
                                      num_valid_tokens=nv,
-                                     defer_all_reduce=bool(self.reduce_axes))
+                                     defer_all_reduce=bool(self.reduce_axes),
+                                     scatter_results=self.scatter_results)
             parts.append(routed)
         routed = jnp.concatenate(parts) if n > 1 else parts[0]
         out = (routed * self.routed_scaling_factor).astype(
