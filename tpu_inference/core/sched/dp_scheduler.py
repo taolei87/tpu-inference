@@ -142,6 +142,21 @@ def _disable_cloudpickle():
     multiprocessing.reduction.ForkingPickler.loads = _original_loads
 
 
+def _picklable_request(request):
+    """`request` as sent to a rank process: a structured-output request's
+    grammar is being compiled here (a Future, holding a lock that can't be
+    pickled: tool-call requests killed the engine under DP), so the copy goes
+    without it and the rank compiles its own. The request itself is left as
+    is."""
+    sor = getattr(request, "structured_output_request", None)
+    if sor is None or getattr(sor, "_grammar", None) is None:
+        return request
+    req = copy.copy(request)
+    req.structured_output_request = copy.copy(sor)
+    req.structured_output_request._grammar = None
+    return req
+
+
 def _scheduler_worker_process(
     rank: int,
     input_conn: Connection,
@@ -215,6 +230,13 @@ def _scheduler_worker_process(
             match command:
                 case SchedulerCommand.ADD_REQUEST:
                     request = data
+                    sor = getattr(request, "structured_output_request", None)
+                    if sor is not None and getattr(sor, "_grammar",
+                                                   None) is None:
+                        # sent without its grammar (see _picklable_request):
+                        # this rank's manager compiles it, as EngineCore does
+                        scheduler.structured_output_manager.grammar_init(
+                            request)
                     scheduler.add_request(request)
                     _send_result(None)  # Signal completion
 
@@ -782,7 +804,7 @@ class DPScheduler(SchedulerInterface):
             if enable_cache:
                 self._send_command(rank,
                                    SchedulerCommand.PROBE_COMPUTED_BLOCKS,
-                                   request)
+                                   _picklable_request(request))
             self._send_command(rank,
                                SchedulerCommand.GET_PENDING_PREFILL_TOKENS)
             self._send_command(rank, SchedulerCommand.GET_REQUEST_COUNTS)
@@ -842,7 +864,8 @@ class DPScheduler(SchedulerInterface):
         rank = self._pick_rank_for_request(request)
         self.assigned_dp_rank[request.request_id] = rank
 
-        self._send_command(rank, SchedulerCommand.ADD_REQUEST, request)
+        self._send_command(rank, SchedulerCommand.ADD_REQUEST,
+                           _picklable_request(request))
         self._get_result(rank, SchedulerCommand.ADD_REQUEST)
 
     def _flush_pending(self) -> None:

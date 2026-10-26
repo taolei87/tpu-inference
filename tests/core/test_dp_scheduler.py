@@ -1356,3 +1356,28 @@ class TestUpdateVllmConfigForDPScheduler:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_picklable_request_drops_a_compiling_grammar():
+    """A structured-output request (e.g. a tool call) carries its grammar as a
+    Future under compilation, whose lock can't be pickled to the rank
+    processes: the copy sent goes without it; the request keeps it."""
+    import concurrent.futures
+    import types
+
+    import cloudpickle
+
+    from tpu_inference.core.sched.dp_scheduler import _picklable_request
+    fut = concurrent.futures.Future()
+    req = types.SimpleNamespace(
+        request_id="r1",
+        structured_output_request=types.SimpleNamespace(_grammar=fut))
+    with pytest.raises(TypeError):
+        cloudpickle.dumps(req)
+    sent = cloudpickle.loads(cloudpickle.dumps(_picklable_request(req)))
+    assert sent.request_id == "r1"
+    assert sent.structured_output_request._grammar is None
+    assert req.structured_output_request._grammar is fut
+    plain = types.SimpleNamespace(request_id="r2",
+                                  structured_output_request=None)
+    assert _picklable_request(plain) is plain
