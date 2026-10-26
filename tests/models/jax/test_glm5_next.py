@@ -993,6 +993,122 @@ def test_prefix_caching_align_mode(tmp_path, monkeypatch):
         assert _rel(logits, ref[rid][1][start:]) < 1e-4, rid
 
 
+@pytest.mark.parametrize("ep", [False, True], ids=["attn_dp", "attn_dp_ep"])
+def test_prefix_caching_align_mode_with_attention_dp(tmp_path, monkeypatch,
+                                                     ep):
+    """test_prefix_caching_align_mode on two attention-DP ranks of TP=2 at
+    once (the M11.2 layout in small: with `ep` the experts are sharded whole
+    over all 4 devices). Each rank runs the scenario with its own requests,
+    rank-local pages and KDA / indexer-tail state slots, packed into one
+    step per rank segment as the runner does under DP."""
+    from tpu_inference.layers.jax.attention import kda as kda_layer
+    from tpu_inference.models.jax import glm5_next as glm_module
+    monkeypatch.setattr(kda_layer, "align_block_size", lambda: PAGE)
+    monkeypatch.setattr(glm_module, "align_block_size", lambda: PAGE)
+    if jax.default_backend() != "tpu":
+        monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "1000000")
+    d = str(tmp_path)
+    MT.write_tiny_checkpoint(d, seed=29, index_topk=16)
+    vllm_config, model, mesh = _build(d, tp=2, attn_dp=2, ep=ep)
+    text = vllm_config.model_config.hf_text_config
+    ranks, n_slots = 2, 16
+    ids, rank_caches, pages, states = {}, [], [], []
+    for r in range(ranks):
+        rng = np.random.default_rng(14 + r)
+        a = rng.integers(0, text.vocab_size, 50)
+        ids[(r, 0)] = a
+        ids[(r, 1)] = np.concatenate(
+            [a[:32], rng.integers(0, text.vocab_size, 25)])
+        c = _Caches(text, seed=r)
+        lay = c.lay
+        state_names = {KV.layer_name(i) for i in lay.kda_layers}
+        state_names |= {KV.indexer_tail_name(i) for i in lay.mla_layers}
+        for name in state_names:  # fresh slot pools with garbage in them
+            idx = c.index[name]
+            c.kv_caches[idx] = tuple(
+                jnp.asarray(rng.standard_normal((n_slots, ) +
+                                                x.shape[1:]), x.dtype)
+                for x in c.kv_caches[idx])
+        pg = c.block_tables.reshape(MAX_REQS, PAGES_PER_SEQ).copy()
+        pg[1, :2] = pg[0, :2]
+        st = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+        st[0, :4] = [5, 9, 2, 14][::1 - 2 * r]  # different slots per rank
+        st[1, 1:4] = [9, 7, 11] if r == 0 else [2, 3, 6]  # block 1 shared
+        rank_caches.append(c)
+        pages.append(pg)
+        states.append(st)
+    ref = _reference(d, ids, sparse="always")
+    index = rank_caches[0].index
+    kv = jax.tree.map(lambda *a: jnp.concatenate(a),
+                      *[c.kv_caches for c in rank_caches])
+
+    def run(step):
+        """step: the same [(local id, first position, num tokens)] on every
+        rank."""
+        mds = [c.metadata(step) for c in rank_caches]
+        T = max(t for _, t in mds)
+        per_rank, tokens = [], []
+        for r, (md, _) in enumerate(mds):
+            md = dataclasses.replace(md,
+                                     input_positions=jnp.pad(
+                                         md.input_positions,
+                                         (0, T - md.input_positions.shape[0])))
+            page_bt = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+            state_bt = np.zeros((MAX_REQS, PAGES_PER_SEQ), np.int32)
+            for i, (rid, _, _) in enumerate(step):
+                page_bt[i], state_bt[i] = pages[r][rid], states[r][rid]
+            page_md = dataclasses.replace(md,
+                                          block_tables=jnp.asarray(
+                                              page_bt.reshape(-1)),
+                                          mamba_state_indices=None)
+            state_md = dataclasses.replace(page_md,
+                                           block_tables=jnp.asarray(
+                                               state_bt.reshape(-1)))
+            per_rank.append((page_md, state_md))
+            tk = np.concatenate(
+                [ids[(r, rid)][p0:p0 + n] for rid, p0, n in step])
+            tokens.append(np.pad(tk, (0, T - len(tk))))
+        cat = lambda *a: jnp.concatenate(a)  # noqa: E731
+        page_md = jax.tree.map(cat, *[p for p, _ in per_rank])
+        state_md = jax.tree.map(cat, *[s for _, s in per_rank])
+        layer_mds = {
+            n: state_md if n in state_names else page_md
+            for n in index
+        }
+        names = tuple(index.items())
+
+        @jax.jit
+        def fwd(model, kv, tok, mds):
+            kv, h, _, _ = model(kv, tok, mds, None, None, names)
+            return kv, h
+
+        nonlocal kv
+        with jax.set_mesh(mesh):
+            kv, h = fwd(model, kv, jnp.asarray(np.concatenate(tokens)),
+                        layer_mds)
+        out = {}
+        for r in range(ranks):
+            t = r * T
+            for rid, p0, n in step:
+                out[(r, rid)] = np.asarray(h[t:t + n])
+                t += n
+        return out
+
+    steps = [[(0, 0, 16)], [(0, 16, 16)], [(0, 32, 8), (1, 32, 16)],
+             [(0, 40, 1), (1, 48, 7)]]
+    steps += [[(0, 41 + i, 1), (1, 55 + i, 1)] for i in range(2)]
+    steps += [[(0, p, 1)] for p in range(43, 50)]
+    got = {g: [] for g in ids}
+    for step in steps:
+        for g, h in run(step).items():
+            got[g].append(h)
+    for (r, rid), parts in got.items():
+        start = 0 if rid == 0 else 32
+        h = np.concatenate(parts)
+        assert h.shape[0] == len(ids[(r, rid)]) - start, (r, rid)
+        assert _rel(h, ref[(r, rid)][0][start:]) < 1e-4, (r, rid)
+
+
 def test_align_block_size_is_the_attention_block_size():
     """Under the Ray executor the platform aligns mamba_block_size only after
     the model is built, so the layers must use block_size."""
