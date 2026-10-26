@@ -91,6 +91,24 @@ def all_gather_topk_indices_and_weights(
     return topk_indices, topk_weights
 
 
+def padding_expert_ids(topk_indices: jax.Array, token_valid: jax.Array,
+                       num_experts: int, use_ep: bool) -> jax.Array:
+    """The experts the padding tokens (token_valid False, [T, 1]) are routed to,
+    with weight 0. With tensor-parallel experts expert 0 is split over every
+    chip, so sending all padding there reads the fewest weights. With expert
+    parallelism expert 0 lives on one chip, which would then run every padding
+    row (a lone prefill under attention DP pads every other rank's segment:
+    ~30x a chip's share on a v6e-128), so the padding is spread over all
+    experts instead."""
+    if use_ep:
+        T, k = topk_indices.shape
+        pad = (jnp.arange(T * k, dtype=topk_indices.dtype) %
+               num_experts).reshape(T, k)
+    else:
+        pad = 0
+    return jnp.where(token_valid, topk_indices, pad)
+
+
 def apply_scoring_fn(scoring_fn: str, x: jax.Array) -> jax.Array:
     match scoring_fn:
         case "softmax":
@@ -1088,7 +1106,8 @@ def fused_moe_func(
         # a count of leading real tokens, or a [num_tokens] mask of them
         token_valid = (num_valid_tokens if num_valid_tokens.ndim else
                        jnp.arange(num_tokens) < num_valid_tokens)[:, None]
-        topk_indices = jnp.where(token_valid, topk_indices, 0)
+        topk_indices = padding_expert_ids(topk_indices, token_valid,
+                                          global_num_experts, use_ep)
         topk_weights = jnp.where(token_valid, topk_weights, 0.0)
     # All gathering topk_indices and topk_weights if attention dp is used.
     # MOE_FOLD_ROUTING_INTO_DISPATCH gathers them in the token all-gather.

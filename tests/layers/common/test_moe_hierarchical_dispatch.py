@@ -573,3 +573,20 @@ def test_fused_moe_fold_needs_attention_only_axes():
     actual, calls = _run_fused_moe_fold(mesh, True, False, use_ep=True)
     assert calls == 1
     _assert_bitwise_equal(actual, expected)
+
+
+def test_padding_expert_ids_spread_under_expert_parallelism():
+    """Padding tokens go to expert 0 with tensor-parallel experts, and are
+    spread evenly over all experts with expert parallelism (expert 0 lives on
+    one chip there); real tokens keep their routing."""
+    import numpy as np
+
+    from tpu_inference.layers.common.fused_moe_gmm import padding_expert_ids
+    ids = jnp.asarray(np.arange(16 * 2).reshape(16, 2) % 7, jnp.int32)
+    valid = (jnp.arange(16) < 4)[:, None]
+    tp = np.asarray(padding_expert_ids(ids, valid, 8, use_ep=False))
+    ep = np.asarray(padding_expert_ids(ids, valid, 8, use_ep=True))
+    assert (tp[:4] == np.asarray(ids)[:4]).all() and (ep[:4] == tp[:4]).all()
+    assert (tp[4:] == 0).all()
+    counts = np.bincount(ep[4:].reshape(-1), minlength=8)
+    assert counts.max() - counts.min() <= 1, counts
