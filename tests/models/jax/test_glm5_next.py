@@ -442,6 +442,36 @@ def test_mla_query_split_with_fewer_tokens_than_head_shards(tmp_path):
         assert _rel(h, ref[rid][0]) < 1e-4, rid
 
 
+def test_wide_expert_parallel_scatter_with_short_rank_segments(
+        tmp_path, monkeypatch):
+    """The one-collective reduce-scatter of the routed output pads each
+    rank's token segment to a multiple of the TP size: 3-token segments at
+    TP=2 (a decode step with fewer tokens per rank than TP shards)."""
+    if jax.default_backend() != "tpu":
+        monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "1000000")
+    monkeypatch.setenv("MOE_SCATTER_ONE_COLLECTIVE", "1")
+    d = str(tmp_path)
+    # top-8 of 8 experts: the MoE needs tokens * top_k % 16 == 0 at 6 tokens
+    MT.write_tiny_checkpoint(d, seed=26, num_experts_per_tok=8)
+    vllm_config, model, mesh = _build(d, tp=2, attn_dp=2, ep=True)
+    assert all(layer.mlp.scatter_results for layer in model.model.layers
+               if type(layer.mlp).__name__ == "Glm5NextMoE")
+    text = vllm_config.model_config.hf_text_config
+    rng = np.random.default_rng(7)
+    lens = {(0, 0): 9, (1, 0): 8}
+    ids = {g: rng.integers(0, text.vocab_size, n) for g, n in lens.items()}
+    caches = _DPCaches(text, 2)
+    for c in caches.ranks:
+        c.pad_to = 3
+    steps = [[[((0, 0), 0, 8)], [((1, 0), 0, 6)]],
+             [[((0, 0), 8, 1)], [((1, 0), 6, 2)]]]  # 2 + 1 tokens per rank
+    outs = [caches.run(model, mesh, st, ids) for st in steps]
+    ref = _reference(d, ids)
+    for g in ids:
+        h = np.concatenate([o[g][0] for o in outs if g in o])
+        assert _rel(h, ref[g][0]) < 1e-4, g
+
+
 def test_registry(tiny_dir):
     try:
         from tpu_inference.models.common.model_loader import \

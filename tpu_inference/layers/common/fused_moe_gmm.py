@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import Literal
 
 import jax
@@ -418,7 +419,19 @@ def moe_gmm_local(x: jax.Array,
             # major: device (r, m) gets token slice r * n_reduce + m), then an
             # all-gather of the rank's slices over the reduce axes: one
             # rounding of the partial sums, about half an all-reduce's bytes.
-            out = jax.lax.psum_scatter(chunk_hidden,
+            # Each rank's token segment is padded to a multiple of the reduce
+            # size first (a decode step can give a rank fewer tokens than TP
+            # shards).
+            n_sc = math.prod(jax.lax.axis_size(a) for a in scatter_axes)
+            n_red = math.prod(jax.lax.axis_size(a) for a in reduce_axes)
+            t_rank = chunk_hidden.shape[0] // n_sc
+            pad = -t_rank % n_red
+            h = chunk_hidden
+            if pad:
+                h = jnp.pad(h.reshape(n_sc, t_rank, -1),
+                            ((0, 0), (0, pad),
+                             (0, 0))).reshape(n_sc * (t_rank + pad), -1)
+            out = jax.lax.psum_scatter(h,
                                        axis_name=tuple(scatter_axes) +
                                        tuple(reduce_axes),
                                        scatter_dimension=0,
@@ -426,7 +439,7 @@ def moe_gmm_local(x: jax.Array,
             out = jax.lax.all_gather(out,
                                      axis_name=tuple(reduce_axes),
                                      axis=0,
-                                     tiled=True).astype(x.dtype)
+                                     tiled=True)[:t_rank].astype(x.dtype)
         elif scatter_results:
             if reduce_axes:
                 chunk_hidden = jax.lax.psum(chunk_hidden,
