@@ -178,6 +178,8 @@ def moe_apply(
                     moe_chunk_size=moe_chunk_size,
                     num_valid_tokens=extra_backend_kwargs.get(
                         "num_valid_tokens", None),
+                    a2a_dispatch=envs.MOE_A2A_DISPATCH
+                    and x.shape[0] >= envs.MOE_A2A_MIN_TOKENS,
                 )
             case MoEBackend.DENSE_MAT:
                 # NOTE: circular import avoidance

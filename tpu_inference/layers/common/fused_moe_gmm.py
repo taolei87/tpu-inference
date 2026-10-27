@@ -972,6 +972,215 @@ def _apply_hierarchical_dispatch_gather(hidden_states: jax.Array,
     )(*args)
 
 
+def _ragged_all_to_all(operand: jax.Array, output: jax.Array,
+                       input_offsets: jax.Array, send_sizes: jax.Array,
+                       output_offsets: jax.Array, recv_sizes: jax.Array,
+                       axes: tuple) -> jax.Array:
+    """jax.lax.ragged_all_to_all over `axes`; off TPU (XLA:CPU has no
+    ragged-all-to-all) the same result from all-gathers, for tests.
+
+    Device i sends operand[input_offsets[j]:+send_sizes[j]] to device j, which
+    puts it at output[output_offsets[j]:] (offsets in j's buffer, as the sender
+    computes them); recv_sizes[i] is how many rows device i gets from each
+    sender."""
+    if jax.default_backend() == "tpu":
+        return jax.lax.ragged_all_to_all(operand,
+                                         output,
+                                         input_offsets,
+                                         send_sizes,
+                                         output_offsets,
+                                         recv_sizes,
+                                         axis_name=axes)
+    me = jax.lax.axis_index(axes)
+    ops = jax.lax.all_gather(operand, axes)  # [senders, rows, ...]
+    i_off, n, o_off = (jax.lax.all_gather(a, axes)[:, me]
+                       for a in (input_offsets, send_sizes, output_offsets))
+    j = jnp.arange(output.shape[0])
+    for s in range(ops.shape[0]):
+        k = j - o_off[s]
+        hit = (k >= 0) & (k < n[s])
+        rows = ops[s][jnp.clip(i_off[s] + k, 0, operand.shape[0] - 1)]
+        output = jnp.where(hit.reshape((-1, ) + (1, ) * (output.ndim - 1)),
+                           rows, output)
+    return output
+
+
+def _offsets(offsets: jax.Array, sizes: jax.Array) -> jax.Array:
+    """Offsets of empty ragged all-to-all chunks set to 0 (in bounds)."""
+    return jnp.where(sizes > 0, offsets, 0)
+
+
+_A2A_STATS: list = []
+
+
+def _a2a_stats(per_chip: np.ndarray, recv_rows: int, me: np.ndarray):
+    """MOE_A2A_STATS: summarize the rows each chip got, every 500 calls."""
+    if int(me) != 0:
+        return
+    per_chip = np.asarray(per_chip, np.float64)
+    if per_chip.sum() == 0:
+        return
+    _A2A_STATS.append(
+        (per_chip.max() / per_chip.mean(),
+         np.ceil(per_chip.max() / int(recv_rows)), per_chip.sum(),
+         int(per_chip.argmax())))
+    if len(_A2A_STATS) % 500 == 0:
+        a = np.asarray(_A2A_STATS[-500:])
+        hot = np.bincount(a[:, 3].astype(int)).argsort()[::-1][:5]
+        logger.info(
+            "MOE_A2A_STATS: last 500 calls: max/mean rows per chip p50 %.1f "
+            "p90 %.1f max %.1f; rounds mean %.2f max %d; rows mean %d; "
+            "most often hottest chips %s", np.percentile(a[:, 0], 50),
+            np.percentile(a[:, 0], 90), a[:, 0].max(), a[:, 1].mean(),
+            a[:, 1].max(), a[:, 2].mean(), hot.tolist())
+
+
+def _a2a_recv_rows(num_rows: int, n_ep: int) -> int:
+    """The receive buffer of the all-to-all dispatch: MOE_A2A_RECV_FACTOR times
+    a chip's mean share of the step's (token, expert) rows, in whole 256-row
+    tiles, and never more than all of them. A chip that gets more rows takes
+    them in more rounds."""
+    mean = -(-num_rows // n_ep)
+    rows = math.ceil(envs.MOE_A2A_RECV_FACTOR * mean / 256) * 256
+    return max(256, min(rows, -(-num_rows // 256) * 256))
+
+
+def _a2a_moe(hidden_states: jax.Array, topk_indices: jax.Array,
+             topk_weights: jax.Array, token_valid: jax.Array | None,
+             w1: jax.Array, w1_scale: jax.Array | None,
+             w1_bias: jax.Array | None, w2: jax.Array,
+             w2_scale: jax.Array | None, w2_bias: jax.Array | None, *,
+             activation: str, topk: int, mesh: Mesh, fp8: bool,
+             recv_rows: int) -> jax.Array:
+    """Routed experts by a ragged all-to-all dispatch (MOE_A2A_DISPATCH).
+
+    Under attention DP each rank's chips hold its token segment; each chip
+    takes 1/n of the segment (n the chips of a rank), sends each real
+    (token, expert) row to the chip of the expert (fp8 with a per-row scale
+    when `fp8`), runs its experts' GMMs on what it receives, and sends the
+    outputs back; the source weights and sums them in f32, and the rank's
+    chips all-gather their slices. Padding tokens (token_valid False) send
+    nothing. Returns the routed sum [num_tokens, hidden] split over the
+    attention-DP ranks."""
+    ep_axes = _as_axes(ShardingAxisName.EXPERT)
+    attn = _as_axes(ShardingAxisName.ATTN_DATA)
+    local_axes = tuple(a for a in ep_axes if a not in attn)
+    n_ep = math.prod(mesh.shape[a] for a in ep_axes)
+    n_local = math.prod(mesh.shape[a] for a in local_axes)
+    num_experts, padded_hidden, _ = w1.shape
+    per_chip = num_experts // n_ep
+    hidden = hidden_states.shape[1]
+    dtype = hidden_states.dtype
+    if token_valid is None:
+        token_valid = jnp.ones((hidden_states.shape[0], 1), jnp.bool_)
+    unit = jnp.uint8 if fp8 else jnp.uint16
+
+    def local(x, ids, wts, valid, w1, w1_scale, w1_bias, w2, w2_scale,
+              w2_bias):
+        seg = x.shape[0]
+        n_tok = -(-seg // n_local)
+        pad = n_tok * n_local - seg
+        if pad:
+            x, ids, wts, valid = (jnp.pad(a, ((0, pad), (0, 0)))
+                                  for a in (x, ids, wts, valid))
+        lo = jax.lax.axis_index(local_axes) * n_tok if local_axes else 0
+        x, ids, wts, valid = (jax.lax.dynamic_slice_in_dim(a, lo, n_tok)
+                              for a in (x, ids, wts, valid))
+        # this chip's (token, expert) rows, by expert; padding rows last
+        key = jnp.where(valid, ids, num_experts).reshape(-1).astype(jnp.int32)
+        order = jnp.argsort(key, stable=True)
+        key = key[order]
+        dest = key // per_chip
+        send = jnp.zeros((n_ep + 1, ), jnp.int32).at[dest].add(1)[:n_ep]
+        in_off = jnp.cumulative_sum(send, include_initial=True)[:-1]
+        sizes = jax.lax.all_gather(send, ep_axes)  # [sender, receiver]
+        me = jax.lax.axis_index(ep_axes)
+        recv = sizes[:, me]
+        # where each sender's rows start among each receiver's rows, and
+        # where each receiver's rows start among each sender's sorted rows
+        land = jnp.cumulative_sum(sizes, axis=0, include_initial=True)[:-1]
+        src = jnp.cumulative_sum(sizes, axis=1, include_initial=True)[:, :-1]
+        out_off, recv_land, back_off = land[me], land[:, me], src[:, me]
+        rows = x[order // topk]
+        eid = (key - dest * per_chip)[:, None]
+        if fp8:
+            q, scale = quantize_tensor(jnp.float8_e4m3fn, rows, axis=-1)
+            payload = (q, scale.reshape(-1, 1).astype(jnp.float32), eid)
+        else:
+            payload = (rows, eid)
+        packed = _concat_bits(payload, unit)
+        # whole 128-lane rows
+        packed = jnp.pad(packed, ((0, 0), (0, -packed.shape[1] % 128)))
+        offset = jnp.zeros((1, ), jnp.int32)
+
+        def exchange(r, ret):
+            # receive rows [r * recv_rows, (r + 1) * recv_rows) of every chip
+            lo = r * recv_rows
+            st = jnp.clip(out_off, lo, lo + recv_rows)
+            n_send = jnp.clip(out_off + send, lo, lo + recv_rows) - st
+            rst = jnp.clip(recv_land, lo, lo + recv_rows)
+            n_recv = jnp.clip(recv_land + recv, lo, lo + recv_rows) - rst
+            got = _ragged_all_to_all(
+                packed, jnp.zeros((recv_rows, packed.shape[1]), unit),
+                _offsets(in_off + st - out_off, n_send), n_send,
+                _offsets(st - lo, n_send), n_recv, ep_axes)
+            got_e = jnp.where(
+                jnp.arange(recv_rows) < n_recv.sum(),
+                _split_bits(got, payload)[-1][:, 0], per_chip)
+            # group the received rows by local expert (moving the packed
+            # rows: fp8 is half the bytes of the dequantized ones)
+            by_e = jnp.argsort(got_e, stable=True)
+            group_sizes = jnp.zeros((per_chip + 1, ),
+                                    jnp.int32).at[got_e].add(1)[:per_chip]
+            parts = _split_bits(got[by_e], payload)
+            xg = (_dequantize_fp8(parts[0], parts[1], dtype)
+                  if fp8 else parts[0])
+            xg = jnp.pad(xg, ((0, 0), (0, padded_hidden - hidden)))
+            h = gmm_wrapper(xg,
+                            w1,
+                            w1_scale,
+                            w1_bias,
+                            group_sizes,
+                            offset,
+                            fuse_act=activation,
+                            preferred_element_type=dtype)
+            h = h[:, :w2.shape[1]]
+            y = gmm_wrapper(h, w2, w2_scale, w2_bias, group_sizes, offset)
+            y = y[jnp.argsort(by_e)][:, :hidden]
+            # the outputs back to where their rows sit in the senders'
+            # sorted order
+            return _ragged_all_to_all(
+                y, ret, _offsets(rst - lo, n_recv), n_recv,
+                _offsets(back_off + rst - recv_land, n_recv), n_send, ep_axes)
+
+        if envs.MOE_A2A_STATS:
+            jax.debug.callback(_a2a_stats, sizes.sum(axis=0), recv_rows, me)
+        # one round unless some chip gets more rows than its buffer holds
+        rounds = -(-sizes.sum(axis=0).max() // recv_rows)
+        ret = jax.lax.fori_loop(0, rounds, exchange,
+                                jnp.zeros((key.shape[0], hidden), dtype))
+        ret = ret[jnp.argsort(order)].reshape(n_tok, topk, hidden)
+        out = (ret.astype(jnp.float32) *
+               wts.astype(jnp.float32)[..., None]).sum(axis=1).astype(dtype)
+        if local_axes:
+            out = jax.lax.all_gather(out, local_axes, axis=0, tiled=True)
+        return out[:seg]
+
+    ep = P(ShardingAxisName.EXPERT)
+    rows = P(ShardingAxisName.ATTN_DATA, None)
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(rows, rows, rows, rows, ep, None if w1_scale is None else ep,
+                  None if w1_bias is None else ep, ep,
+                  None if w2_scale is None else ep,
+                  None if w2_bias is None else ep),
+        out_specs=rows,
+        check_vma=False,
+    )(hidden_states, topk_indices, topk_weights, token_valid, w1, w1_scale,
+      w1_bias, w2, w2_scale, w2_bias)
+
+
 @jax.jit(static_argnames=(
     "topk",
     "renormalize",
@@ -986,6 +1195,7 @@ def _apply_hierarchical_dispatch_gather(hidden_states: jax.Array,
     "scatter_results",
     "moe_chunk_size",
     "defer_all_reduce",
+    "a2a_dispatch",
 ))
 def fused_moe_func(
     hidden_states: jax.Array,
@@ -1012,6 +1222,7 @@ def fused_moe_func(
     expert_score_correction_bias: jax.Array | None = None,
     moe_chunk_size: int = 0,
     num_valid_tokens: jax.Array | None = None,
+    a2a_dispatch: bool = False,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -1032,6 +1243,8 @@ def fused_moe_func(
         scoring_fn: scoring function to apply on gating_output.
         enable_rs_kernel: enable custom Hierarchical Reduce-Scatter kernel.
         use_gmm_fused_rs_kernel: enable fused GMM reduce-scatter kernel.
+        a2a_dispatch: under attention DP with expert parallelism, send the
+            tokens to their experts by all-to-all (MOE_A2A_DISPATCH).
 
     Returns:
         Output of moe operation [num_tokens, hidden_size]
@@ -1109,6 +1322,32 @@ def fused_moe_func(
         topk_indices = padding_expert_ids(topk_indices, token_valid,
                                           global_num_experts, use_ep)
         topk_weights = jnp.where(token_valid, topk_weights, 0.0)
+    else:
+        token_valid = None
+    if (a2a_dispatch and use_ep and _attn_only_axes(mesh)
+            and not defer_all_reduce):
+        n_ep = get_mesh_shape_product(mesh, ShardingAxisName.EXPERT)
+        replicas = get_mesh_shape_product(mesh, ShardingAxisName.MLP_DATA)
+        recv_rows = _a2a_recv_rows(num_tokens * topk // replicas, n_ep)
+        logger.info_once(
+            "MOE_A2A_DISPATCH: expert rows by ragged all-to-all over %d "
+            "chips, %d receive rows per chip and round at %d tokens.", n_ep,
+            recv_rows, num_tokens)
+        return _a2a_moe(hidden_states,
+                        topk_indices,
+                        topk_weights,
+                        token_valid,
+                        w1,
+                        w1_scale,
+                        w1_bias,
+                        w2,
+                        w2_scale,
+                        w2_bias,
+                        activation=activation,
+                        topk=topk,
+                        mesh=mesh,
+                        fp8=all_gather_fp8,
+                        recv_rows=recv_rows)
     # All gathering topk_indices and topk_weights if attention dp is used.
     # MOE_FOLD_ROUTING_INTO_DISPATCH gathers them in the token all-gather.
     hierarchical = use_ep and envs.MOE_HIERARCHICAL_DISPATCH

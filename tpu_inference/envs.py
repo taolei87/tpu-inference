@@ -91,6 +91,10 @@ if TYPE_CHECKING:
     MOE_HIERARCHICAL_COLLECT: bool = False
     MOE_FOLD_ROUTING_INTO_DISPATCH: bool = False
     MOE_SCATTER_ONE_COLLECTIVE: bool = False
+    MOE_A2A_DISPATCH: bool = False
+    MOE_A2A_RECV_FACTOR: float = 4.0
+    MOE_A2A_MIN_TOKENS: int = 0
+    MOE_A2A_STATS: bool = False
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
     MOE_GATHER_REDUCE_ON_TC: bool = False
@@ -592,6 +596,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expert parallelism then scatters its routed-expert outputs.
     "MOE_SCATTER_ONE_COLLECTIVE":
     env_bool("MOE_SCATTER_ONE_COLLECTIVE", default=False),
+
+    # Expert-parallel dispatch under attention DP by a ragged all-to-all: each
+    # chip sends only its real tokens' rows to the chips of their experts and
+    # gets the expert outputs back, instead of all-gathering every rank's
+    # padded segment and all-reducing the outputs. The receive buffer holds
+    # MOE_A2A_RECV_FACTOR times a chip's mean share of the step's rows; a step
+    # whose routing would overflow it takes the all-gather path.
+    "MOE_A2A_DISPATCH":
+    env_bool("MOE_A2A_DISPATCH", default=False),
+    "MOE_A2A_RECV_FACTOR":
+    lambda: float(os.getenv("MOE_A2A_RECV_FACTOR", "4.0")),
+    # Use the all-to-all dispatch only for steps of at least this many tokens
+    # (all ranks together): decode steps are latency-bound, and the all-gather
+    # dispatch's two collectives beat the all-to-all's four there.
+    "MOE_A2A_MIN_TOKENS":
+    lambda: int(os.getenv("MOE_A2A_MIN_TOKENS", "0")),
+    # Debug: log how evenly the all-to-all dispatch's rows spread over the
+    # chips (max / mean rows per chip, exchange rounds), every 500 MoE calls.
+    "MOE_A2A_STATS":
+    env_bool("MOE_A2A_STATS", default=False),
 
     # EP dispatch permute gather: the ragged_gather_v2 kernel
     # (kernels/sparse_core/ragged_gather_v2.py), called from fused_moe_gmm.py.

@@ -362,8 +362,8 @@ def test_model_matches_reference_with_attention_dp(tmp_path, dp):
 # (scatter_results' default two-step reduction, a psum over the TP axes then a
 # reduce-scatter over the ranks, rounds the bf16 partial sums twice: 2x the
 # error here; GLM uses the one-collective form.)
-@pytest.mark.parametrize("scatter", ["", "one-collective"],
-                         ids=["allreduce", "scatter"])
+@pytest.mark.parametrize("scatter", ["", "one-collective", "a2a", "a2a-full"],
+                         ids=["allreduce", "scatter", "a2a", "a2a_full"])
 @pytest.mark.parametrize("fp8", [False, True], ids=["f32", "fp8"])
 def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, scatter,
                                                   monkeypatch):
@@ -376,8 +376,14 @@ def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, scatter,
         # are TPU-only)
         monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "1000000")
     # the routed output all-reduced to every rank, or reduce-scattered to the
-    # ranks' tokens in one collective
-    monkeypatch.setenv("MOE_SCATTER_ONE_COLLECTIVE", "1" if scatter else "0")
+    # ranks' tokens in one collective, or the tokens' rows sent to their
+    # experts by all-to-all (a2a_full: 16-row receive buffers, so most steps
+    # take several rounds)
+    monkeypatch.setenv("MOE_SCATTER_ONE_COLLECTIVE",
+                       "1" if scatter == "one-collective" else "0")
+    monkeypatch.setenv("MOE_A2A_DISPATCH", "1" if "a2a" in scatter else "0")
+    if scatter == "a2a-full":
+        monkeypatch.setattr(fused_moe_gmm, "_a2a_recv_rows", lambda *_: 16)
     d = str(tmp_path)
     MT.write_tiny_checkpoint(d, seed=24, fp8=fp8, n_routed_experts=6)
     dtype = "bfloat16" if fp8 else "float32"
@@ -390,7 +396,8 @@ def test_wide_expert_parallel_with_padded_experts(tmp_path, fp8, scatter,
     assert moes and all(m.num_pad_experts == 2 for m in moes)
     assert all(m.experts.moe_backend == MoEBackend.GMM_EP for m in moes)
     assert all(m.experts.kernel_down_proj_EFD[...].shape[0] == 8 for m in moes)
-    assert all(m.scatter_results == bool(scatter) for m in moes)
+    assert all(m.scatter_results == (scatter == "one-collective")
+               for m in moes)
     text = vllm_config.model_config.hf_text_config
     rng = np.random.default_rng(5)
     lens = {(0, 0): 21, (0, 1): 3, (1, 0): 16}
