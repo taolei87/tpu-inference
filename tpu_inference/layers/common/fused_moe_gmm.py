@@ -1012,11 +1012,20 @@ def _offsets(offsets: jax.Array, sizes: jax.Array) -> jax.Array:
 
 _A2A_STATS: list = []
 
+_A2A_EXPERT_COUNTS: list = []
 
-def _a2a_stats(per_chip: np.ndarray, recv_rows: int, me: np.ndarray):
-    """MOE_A2A_STATS: summarize the rows each chip got, every 500 calls."""
+
+def _a2a_stats(per_chip: np.ndarray, per_expert: np.ndarray, recv_rows: int,
+               me: np.ndarray):
+    """MOE_A2A_STATS: summarize the rows each chip got, every 500 calls. With
+    MOE_A2A_STATS_DUMP (a path), also save every call's rows per expert there
+    (np.save, [calls, experts], every 1000 calls)."""
     if int(me) != 0:
         return
+    if envs.MOE_A2A_STATS_DUMP:
+        _A2A_EXPERT_COUNTS.append(np.asarray(per_expert, np.int32))
+        if len(_A2A_EXPERT_COUNTS) % 1000 == 0:
+            np.save(envs.MOE_A2A_STATS_DUMP, np.stack(_A2A_EXPERT_COUNTS))
     per_chip = np.asarray(per_chip, np.float64)
     if per_chip.sum() == 0:
         return
@@ -1154,7 +1163,11 @@ def _a2a_moe(hidden_states: jax.Array, topk_indices: jax.Array,
                 _offsets(back_off + rst - recv_land, n_recv), n_send, ep_axes)
 
         if envs.MOE_A2A_STATS:
-            jax.debug.callback(_a2a_stats, sizes.sum(axis=0), recv_rows, me)
+            per_expert = jax.lax.psum(
+                jnp.zeros((num_experts + 1, ), jnp.int32).at[key].add(1),
+                ep_axes)[:num_experts]
+            jax.debug.callback(_a2a_stats, sizes.sum(axis=0), per_expert,
+                               recv_rows, me)
         # one round unless some chip gets more rows than its buffer holds
         rounds = -(-sizes.sum(axis=0).max() // recv_rows)
         ret = jax.lax.fori_loop(0, rounds, exchange,

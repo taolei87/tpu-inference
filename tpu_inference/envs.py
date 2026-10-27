@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     MOE_A2A_RECV_FACTOR: float = 4.0
     MOE_A2A_MIN_TOKENS: int = 0
     MOE_A2A_STATS: bool = False
+    MOE_A2A_STATS_DUMP: str = ""
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
     MOE_GATHER_REDUCE_ON_TC: bool = False
@@ -616,6 +617,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # chips (max / mean rows per chip, exchange rounds), every 500 MoE calls.
     "MOE_A2A_STATS":
     env_bool("MOE_A2A_STATS", default=False),
+    "MOE_A2A_STATS_DUMP":
+    lambda: os.getenv("MOE_A2A_STATS_DUMP", ""),
 
     # EP dispatch permute gather: the ragged_gather_v2 kernel
     # (kernels/sparse_core/ragged_gather_v2.py), called from fused_moe_gmm.py.
