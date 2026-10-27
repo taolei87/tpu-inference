@@ -785,6 +785,41 @@ def test_phased_profiler_skips_decode_only_steps_based_on_kv_len(
     assert profiler.current_phase == ""
 
 
+def test_phased_profiler_skips_prefill_only_steps_based_on_kv_len(
+        profiler_fixture):
+    """Tests that the profiler skips PREFILL_ONLY steps until min KV len
+    reaches threshold (the late chunks of one long prompt)."""
+    profiler = profiler_fixture["profiler"]
+    mock_start = profiler_fixture["mock_start"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+
+    profiler.prefill_kv_len_threshold = 4096
+    stats = {
+        "num_reqs": 1,
+        "total_num_scheduled_tokens": 2048,
+        "min_kv_len": 2048
+    }
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+
+    # Should be skipped as min_kv_len (2048) < threshold (4096)
+    profiler.step(stats)
+    mock_start.assert_not_called()
+
+    # Decode-only steps are not affected by the prefill threshold
+    mock_determine_phase.return_value = InferencePhase.DECODE_ONLY
+    profiler.step(stats)
+    mock_start.assert_called_once()
+    for _ in range(PHASED_PROFILER_NUM_STEPS_TO_PROFILE_FOR):
+        profiler.step(stats)
+
+    # Should start profiling as min_kv_len (4096) >= threshold (4096)
+    mock_determine_phase.return_value = InferencePhase.PREFILL_ONLY
+    stats["min_kv_len"] = 4096
+    profiler.step(stats)
+    assert mock_start.call_count == 2
+    assert profiler.current_phase.startswith("prefill_only")
+
+
 def test_phased_profiler_track_concurrency_disabled(profiler_fixture):
     """Tests that when track_concurrency is False, phase names omit concurrency suffix."""
     profiler = profiler_fixture["profiler"]

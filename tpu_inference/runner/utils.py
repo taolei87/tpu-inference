@@ -128,6 +128,8 @@ PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP = 0
 # For decode only batches, start capturing traces after all requests in the
 # batch has KV caches that have reached this length threshold
 PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD = -1
+# The same for prefill only batches (e.g. the late chunks of one long prompt)
+PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD = -1
 PHASED_PROFILER_TRACK_CONCURRENCY = False
 
 logger = init_logger(__name__)
@@ -614,6 +616,9 @@ class PhasedBasedProfiler:
         self.decode_kv_len_threshold: int = int(
             os.getenv("PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD",
                       PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD))
+        self.prefill_kv_len_threshold: int = int(
+            os.getenv("PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD",
+                      PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD))
         self.track_concurrency: bool = os.getenv(
             "PHASED_PROFILER_TRACK_CONCURRENCY",
             str(PHASED_PROFILER_TRACK_CONCURRENCY)).lower() in ("1", "true")
@@ -708,6 +713,16 @@ class PhasedBasedProfiler:
                     logger.debug(
                         "Skipping decode-only step as min KV len %d < threshold %d.",
                         min_kv_len, self.decode_kv_len_threshold)
+                    break
+
+            # Skip prefill-only steps until min KV len reaches threshold
+            if phase == InferencePhase.PREFILL_ONLY and \
+                    self.prefill_kv_len_threshold >= 0:
+                min_kv_len = batch_composition_stats.get("min_kv_len", 0)
+                if min_kv_len < self.prefill_kv_len_threshold:
+                    logger.debug(
+                        "Skipping prefill-only step as min KV len %d < threshold %d.",
+                        min_kv_len, self.prefill_kv_len_threshold)
                     break
 
             self.inference_phases_profiled.add(profile_key)
