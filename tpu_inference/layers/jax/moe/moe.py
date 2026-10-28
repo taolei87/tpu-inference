@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from dataclasses import InitVar, dataclass
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from flax.typing import Sharding
 from jax.sharding import NamedSharding, PartitionSpec
@@ -342,13 +343,25 @@ class JaxMoE(JaxModule):
         return loaded_names
 
 
-def concat_experts(slots, num_experts: Optional[int] = None) -> jax.Array:
+def concat_experts(
+        slots,
+        num_experts: Optional[int] = None,
+        replica_sources: Optional[Sequence[int]] = None) -> jax.Array:
     """The per-expert arrays [1, ...] stacked on the expert axis, padded with
-    zero experts to `num_experts`."""
+    zero experts to `num_experts`. `replica_sources[j]` >= 0 fills padding
+    slot j with a copy of that expert instead (an expert replica)."""
     x = jnp.concatenate(slots, axis=0)
     pad = (num_experts or x.shape[0]) - x.shape[0]
     if pad > 0:
         x = jnp.pad(x, ((0, pad), ) + ((0, 0), ) * (x.ndim - 1))
+    if pad > 0 and replica_sources is not None:
+        assert len(replica_sources) == pad, (len(replica_sources), pad)
+        src = np.arange(x.shape[0])
+        src[x.shape[0] - pad:] = [
+            e if e >= 0 else x.shape[0] - pad + j
+            for j, e in enumerate(replica_sources)
+        ]
+        x = x[src]
     return x
 
 
@@ -393,6 +406,9 @@ class JaxRoutedExperts(JaxModule):
         self.num_local_experts = num_local_experts
         self.num_padded_experts = num_padded_experts or num_local_experts
         assert self.num_padded_experts >= num_local_experts
+        # per padding slot, the expert it holds a copy of (-1: a zero expert);
+        # set by the model before the weights load
+        self.expert_replica_sources: Optional[tuple[int, ...]] = None
         self.hidden_size = hidden_size
         self.intermediate_size_moe = intermediate_size_moe
         self.hidden_act = hidden_act
@@ -494,6 +510,7 @@ class JaxRoutedExperts(JaxModule):
         num_valid_tokens: Optional[jax.Array] = None,
         defer_all_reduce: bool = False,
         scatter_results: bool = False,
+        expert_replica_slots: Optional[jax.Array] = None,
     ) -> tuple[jax.Array, Optional[jax.Array]]:
         """`e_score_correction_bias` [E] (DeepSeek-style noaux_tc routing):
         experts are chosen by score + bias, weighted by the unbiased score.
@@ -504,7 +521,10 @@ class JaxRoutedExperts(JaxModule):
         reduces them, e.g. together with a shared expert's).
         `scatter_results` (attention DP): reduce-scatter the output to the
         ranks' own tokens instead of all-reducing it to every rank.
-        All four are supported by the GMM backends."""
+        `expert_replica_slots` [E_pad] int32: the padding slot holding a copy
+        of each expert (see expert_replica_sources), or -1; the odd tokens
+        routed to a replicated expert go to its copy.
+        All five are supported by the GMM backends."""
         assert self.quant_method is not None
         extra = {}
         if e_score_correction_bias is not None:
@@ -515,6 +535,8 @@ class JaxRoutedExperts(JaxModule):
             extra["defer_all_reduce"] = True
         if scatter_results:
             extra["scatter_results"] = True
+        if expert_replica_slots is not None:
+            extra["expert_replica_slots"] = expert_replica_slots
         kwargs = {}
         if extra:
             if self.moe_backend not in (MoEBackend.GMM_EP, MoEBackend.GMM_TP):
@@ -575,7 +597,8 @@ class JaxRoutedExperts(JaxModule):
             if all(w is not None for w in param._weights_to_load):
                 with cpu_mesh_context():
                     concatenated = concat_experts(param._weights_to_load,
-                                                  self.num_padded_experts)
+                                                  self.num_padded_experts,
+                                                  self.expert_replica_sources)
                 param.value = shard_put(concatenated, param.out_sharding, mesh)
                 loaded_names.add(name)
         return loaded_names

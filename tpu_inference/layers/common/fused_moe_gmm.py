@@ -1236,6 +1236,7 @@ def fused_moe_func(
     moe_chunk_size: int = 0,
     num_valid_tokens: jax.Array | None = None,
     a2a_dispatch: bool = False,
+    expert_replica_slots: jax.Array | None = None,
 ) -> jax.Array:
     """Route tokens in hidden_states into each experts based on routing.
 
@@ -1258,6 +1259,9 @@ def fused_moe_func(
         use_gmm_fused_rs_kernel: enable fused GMM reduce-scatter kernel.
         a2a_dispatch: under attention DP with expert parallelism, send the
             tokens to their experts by all-to-all (MOE_A2A_DISPATCH).
+        expert_replica_slots: [num_experts] int32, the expert slot holding a
+            copy of each expert, or -1 (expert replicas in the padding slots):
+            odd tokens routed to a replicated expert use the copy.
 
     Returns:
         Output of moe operation [num_tokens, hidden_size]
@@ -1324,6 +1328,13 @@ def fused_moe_func(
             topk_weights, topk_indices = jax.lax.top_k(topk_weights, k=topk)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(axis=-1, keepdims=True)
+    if expert_replica_slots is not None:
+        # same weights in both slots: splitting the tokens between them only
+        # spreads the load over two chips
+        copy = expert_replica_slots[topk_indices]
+        odd = (jnp.arange(num_tokens) % 2 == 1)[:, None]
+        topk_indices = jnp.where((copy >= 0) & odd, copy,
+                                 topk_indices).astype(topk_indices.dtype)
     # Route padding tokens to expert 0 instead of picking a selected expert. This
     # is especially useful when we have a low number of tokens (e.g. low
     # concurrency), where padding tokens may activate unnecessary expert weights

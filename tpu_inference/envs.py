@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     MOE_A2A_MIN_TOKENS: int = 0
     MOE_A2A_STATS: bool = False
     MOE_A2A_STATS_DUMP: str = ""
+    GLM5_EXPERT_REPLICAS: str = ""
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
     MOE_GATHER_REDUCE_ON_TC: bool = False
@@ -619,6 +620,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("MOE_A2A_STATS", default=False),
     "MOE_A2A_STATS_DUMP":
     lambda: os.getenv("MOE_A2A_STATS_DUMP", ""),
+    # GLM-5.3-Flash under expert parallelism: a JSON table of expert copies
+    # to put in the padding experts' slots, per MoE layer
+    # ({"layers": {"<layer index>": [[expert, slot], ...]}}); the odd tokens
+    # routed to a copied expert go to its copy.
+    "GLM5_EXPERT_REPLICAS":
+    lambda: os.getenv("GLM5_EXPERT_REPLICAS", ""),
 
     # EP dispatch permute gather: the ragged_gather_v2 kernel
     # (kernels/sparse_core/ragged_gather_v2.py), called from fused_moe_gmm.py.

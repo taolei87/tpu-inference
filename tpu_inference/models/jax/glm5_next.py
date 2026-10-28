@@ -163,6 +163,33 @@ def _fused_reduce_axes(experts, shared, mesh: Mesh) -> tuple:
     return gmm if gmm and set(gmm) == set(mlp) else ()
 
 
+@functools.lru_cache(maxsize=None)
+def _replica_table(path: str) -> dict:
+    import json
+    with open(path) as f:
+        return json.load(f)["layers"]
+
+
+def _expert_replicas(prefix: str, num_experts: int, num_pad: int):
+    """Expert replicas in the padding slots (GLM5_EXPERT_REPLICAS, a JSON
+    {"layers": {"<layer index>": [[expert, slot], ...]}}): per padding slot
+    the expert it copies (-1: none), and per slot the slot of its copy (-1),
+    for this layer; None when it has none."""
+    m = re.search(r"layers\.(\d+)\.mlp$", prefix)
+    if not envs.GLM5_EXPERT_REPLICAS or not num_pad or m is None:
+        return None
+    pairs = _replica_table(envs.GLM5_EXPERT_REPLICAS).get(m.group(1))
+    if not pairs:
+        return None
+    sources, slots = [-1] * num_pad, [-1] * (num_experts + num_pad)
+    for e, slot in pairs:
+        assert 0 <= e < num_experts and slots[e] < 0, (prefix, e)
+        assert num_experts <= slot < num_experts + num_pad, (prefix, slot)
+        assert sources[slot - num_experts] < 0, (prefix, slot)
+        sources[slot - num_experts], slots[e] = e, slot
+    return tuple(sources), tuple(slots)
+
+
 class Glm5NextMoE(JaxModule):
 
     def __init__(self, config, dtype: jnp.dtype, rng: nnx.Rngs, mesh: Mesh,
@@ -202,6 +229,12 @@ class Glm5NextMoE(JaxModule):
             quant_config=quant_config,
             prefix=f"{prefix}.experts")
         self.experts.swiglu_limit = config.swiglu_limit
+        # under EP, copies of hot experts in the padding slots (M11.4)
+        replicas = _expert_replicas(prefix, E, self.num_pad_experts)
+        self.expert_replica_slots = None
+        if replicas is not None:
+            self.experts.expert_replica_sources, self.expert_replica_slots = (
+                replicas)
         self.shared_experts = Glm5NextMLP(config.hidden_size,
                                           config.moe_intermediate_size *
                                           config.n_shared_experts,
@@ -237,6 +270,8 @@ class Glm5NextMoE(JaxModule):
         T, n = x.shape[0], envs.GLM5_MOE_TOKEN_SPLITS
         if n < 2 or T < MOE_SPLIT_MIN_TOKENS or T % (16 * n):
             n = 1
+        replica_slots = (None if self.expert_replica_slots is None else
+                         jnp.asarray(self.expert_replica_slots, jnp.int32))
         parts = []
         for c in range(n):
             lo = c * (T // n)
@@ -249,7 +284,8 @@ class Glm5NextMoE(JaxModule):
                                      e_score_correction_bias=bias,
                                      num_valid_tokens=nv,
                                      defer_all_reduce=bool(self.reduce_axes),
-                                     scatter_results=self.scatter_results)
+                                     scatter_results=self.scatter_results,
+                                     expert_replica_slots=replica_slots)
             parts.append(routed)
         routed = jnp.concatenate(parts) if n > 1 else parts[0]
         out = (routed * self.routed_scaling_factor).astype(
