@@ -381,3 +381,33 @@ class TestFusedMoeGmmOnehotMasking(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConcatExperts(unittest.TestCase):
+    """concat_experts stacks per-expert host arrays in numpy (XLA:CPU pads
+    fp8 at ~0.2 GB/s, which took most of a wide-EP engine's load)."""
+
+    def test_fp8_stacked_padded_and_replicated_bitwise(self):
+        from tpu_inference.layers.jax.moe.moe import concat_experts
+        rng = np.random.default_rng(0)
+        slots = [
+            jnp.asarray(
+                rng.integers(-100, 100, (1, 4, 8),
+                             dtype=np.int8).view(jnp.float8_e4m3fn))
+            for _ in range(6)
+        ]
+        x = concat_experts(slots, 8, [4, -1])
+        self.assertIsInstance(x, np.ndarray)
+        self.assertEqual((x.shape, x.dtype), ((8, 4, 8), slots[0].dtype))
+        ref = np.asarray(jnp.concatenate(slots)).view(np.uint8)
+        got = x.view(np.uint8)
+        np.testing.assert_array_equal(got[:6], ref)
+        np.testing.assert_array_equal(got[6], ref[4])  # the replica slot
+        self.assertFalse(got[7].any())  # a zero expert
+
+    def test_float_scales_without_padding(self):
+        from tpu_inference.layers.jax.moe.moe import concat_experts
+        slots = [np.full((1, 2, 1, 3), i, np.float32) for i in range(3)]
+        x = concat_experts(slots)
+        self.assertEqual(x.shape, (3, 2, 1, 3))
+        np.testing.assert_array_equal(x[:, 0, 0, 0], [0, 1, 2])

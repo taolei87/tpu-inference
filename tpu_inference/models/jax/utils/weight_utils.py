@@ -231,7 +231,8 @@ def shard_put(x: jax.Array,
         mesh = get_mesh()
 
     x_mesh = None
-    if isinstance(x.sharding, NamedSharding):
+    # x may also be a host numpy array (e.g. experts stacked by concat_experts)
+    if isinstance(getattr(x, "sharding", None), NamedSharding):
         x_mesh = x.sharding.mesh
 
     if math.prod(mesh.axis_sizes) == 1:

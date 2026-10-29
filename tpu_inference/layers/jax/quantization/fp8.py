@@ -19,6 +19,7 @@ from typing import Iterable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.sharding import PartitionSpec as P
 
@@ -650,7 +651,8 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 # more than once. We only want to process the weights once all of them are loaded.
                 return False
 
-            from tpu_inference.layers.jax.moe.moe import concat_experts
+            from tpu_inference.layers.jax.moe.moe import (_host_bytes,
+                                                          concat_experts)
 
             # padded with zero experts to the weights' expert axis (see
             # JaxRoutedExperts.num_padded_experts)
@@ -674,8 +676,11 @@ class Fp8FusedMoEMethod(QuantizeMethodBase):
                 # Fuse the weights into w13: [Gate, Up]. w2 is expected to be
                 # (num_experts, hidden_size, intermediate_size), w13 is expected to
                 # be (num_experts, 2 * intermediate_size, hidden_size,)
-                w13_weight = jnp.concatenate([w_gate, w_up], axis=1)
-                w13_weight_scale = jnp.concatenate([s_gate, s_up], axis=1)
+                # on the host, like concat_experts (XLA:CPU copies fp8 slowly)
+                w13_weight = np.concatenate(
+                    [_host_bytes(w_gate),
+                     _host_bytes(w_up)], axis=1).view(w_gate.dtype)
+                w13_weight_scale = np.concatenate([s_gate, s_up], axis=1)
 
             weight_block_size = None
             if self.weight_block_size is not None:

@@ -343,26 +343,43 @@ class JaxMoE(JaxModule):
         return loaded_names
 
 
+def _host_bytes(a) -> np.ndarray:
+    """A host array's raw bytes (a view where possible): numpy copies fp8 and
+    other ml_dtypes arrays at memory speed as uint8, and XLA:CPU pads them
+    at ~0.2 GB/s."""
+    a = np.asarray(a)
+    return a.view(np.uint8) if a.dtype.itemsize == 1 else a
+
+
 def concat_experts(
         slots,
         num_experts: Optional[int] = None,
-        replica_sources: Optional[Sequence[int]] = None) -> jax.Array:
-    """The per-expert arrays [1, ...] stacked on the expert axis, padded with
-    zero experts to `num_experts`. `replica_sources[j]` >= 0 fills padding
-    slot j with a copy of that expert instead (an expert replica)."""
-    x = jnp.concatenate(slots, axis=0)
-    pad = (num_experts or x.shape[0]) - x.shape[0]
-    if pad > 0:
-        x = jnp.pad(x, ((0, pad), ) + ((0, 0), ) * (x.ndim - 1))
+        replica_sources: Optional[Sequence[int]] = None) -> np.ndarray:
+    """The per-expert host arrays [1, ...] stacked on the expert axis, padded
+    with zero experts to `num_experts`. `replica_sources[j]` >= 0 fills
+    padding slot j with a copy of that expert instead (an expert replica).
+
+    Built in numpy: the stacked weights are ~2 GB per tensor and layer, and
+    jnp.pad of fp8 on XLA:CPU took most of a wide-EP engine's 16 minute load
+    (288 experts padded to 384)."""
+    first = np.asarray(slots[0])
+    E = len(slots)
+    total = max(num_experts or E, E)
+    out = np.zeros((total, ) + first.shape[1:], dtype=first.dtype)
+    view = _host_bytes(out)
+    off = 0
+    for s in slots:
+        b = _host_bytes(s)
+        view[off:off + b.shape[0]] = b
+        off += b.shape[0]
+    assert off == E, (off, E)
+    pad = total - E
     if pad > 0 and replica_sources is not None:
         assert len(replica_sources) == pad, (len(replica_sources), pad)
-        src = np.arange(x.shape[0])
-        src[x.shape[0] - pad:] = [
-            e if e >= 0 else x.shape[0] - pad + j
-            for j, e in enumerate(replica_sources)
-        ]
-        x = x[src]
-    return x
+        for j, e in enumerate(replica_sources):
+            if e >= 0:
+                view[E + j] = view[e]
+    return out
 
 
 class JaxRoutedExperts(JaxModule):
