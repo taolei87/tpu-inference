@@ -55,6 +55,37 @@ from tpu_inference.utils import time_function
 logger = init_logger(__name__)
 
 
+def combine_grammar_outputs(
+        outputs: List[Optional[GrammarOutput]]) -> Optional[GrammarOutput]:
+    """The DP ranks' grammar outputs as one, in rank order: request ids
+    concatenated, bitmask rows concatenated along the batch dimension (each
+    rank's rows follow its request ids), and the acceptable-draft counts
+    concatenated, a rank's None (no draft acceptable) as zeros for its
+    requests. The bitmasks are numpy arrays (torch tensors are accepted too):
+    torch.cat on numpy bitmasks killed the engine as soon as two ranks served
+    structured-output requests (tool calls) in the same step."""
+    outputs = [o for o in outputs if o is not None]
+    ids = [i for o in outputs for i in o.structured_output_request_ids]
+    if not ids:
+        return None
+    if len(outputs) == 1:
+        return outputs[0]
+    masks = [o.grammar_bitmask for o in outputs]
+    if all(isinstance(m, torch.Tensor) for m in masks):
+        bitmask = torch.cat(masks, dim=0)
+    else:
+        bitmask = np.concatenate([np.asarray(m) for m in masks], axis=0)
+    drafts = None
+    if any(o.num_acceptable_drafts is not None for o in outputs):
+        drafts = [
+            n for o in outputs
+            for n in (o.num_acceptable_drafts if o.
+                      num_acceptable_drafts is not None else [0] *
+                      len(o.structured_output_request_ids))
+        ]
+    return GrammarOutput(ids, bitmask, drafts)
+
+
 class SchedulerCommand(Enum):
     """Enum for scheduler worker process commands."""
     ADD_REQUEST = "add_request"
@@ -1286,31 +1317,13 @@ class DPScheduler(SchedulerInterface):
         if not self.cached_schedulers_output:
             return None
 
-        combined_structured_output_request_ids = []
-        combined_bitmasks = []
-
         # Get grammar bitmask from each DP rank scheduler
         for rank in range(self.dp_size):
             self._send_command(rank, SchedulerCommand.GET_GRAMMAR_BITMASK)
-        for rank in range(self.dp_size):
-            grammar_output = self._get_result(
-                rank, SchedulerCommand.GET_GRAMMAR_BITMASK)
-            if grammar_output is not None:
-                combined_structured_output_request_ids.extend(
-                    grammar_output.structured_output_request_ids)
-                combined_bitmasks.append(grammar_output.grammar_bitmask)
-
-        if not combined_structured_output_request_ids:
-            return None
-
-        # Combine bitmasks - concatenate along the batch dimension
-        if len(combined_bitmasks) == 1:
-            combined_bitmask = combined_bitmasks[0]
-        else:
-            combined_bitmask = torch.cat(combined_bitmasks, dim=0)
-
-        return GrammarOutput(combined_structured_output_request_ids,
-                             combined_bitmask)
+        return combine_grammar_outputs([
+            self._get_result(rank, SchedulerCommand.GET_GRAMMAR_BITMASK)
+            for rank in range(self.dp_size)
+        ])
 
     @time_function
     def update_from_output(

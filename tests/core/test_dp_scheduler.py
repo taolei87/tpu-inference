@@ -20,7 +20,8 @@ from vllm.config import VllmConfig
 from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata, AuxRequestOutput)
 from vllm.v1.core.sched.interface import PauseState
-from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (CachedRequestData, GrammarOutput,
+                                       SchedulerOutput)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -239,6 +240,27 @@ class TestDPScheduler:
                     mock_init_none_hash.assert_not_called()
 
                     assert scheduler.dp_size == 2
+
+    def test_get_grammar_bitmask_from_two_ranks(
+            self, mock_vllm_config, mock_kv_cache_config,
+            mock_structured_output_manager):
+        """Two ranks with structured-output requests (tool calls) in the same
+        step return numpy bitmasks; they used to be joined with torch.cat,
+        which killed the engine (agent load test, fleet replica p1)."""
+        scheduler = self._create_scheduler(mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager)
+        scheduler.cached_schedulers_output = [MagicMock(), MagicMock()]
+        r0 = GrammarOutput(["a", "b"], np.full((2, 4), 1, np.int32))
+        r1 = GrammarOutput(["c"], np.full((1, 4), 2, np.int32))
+        scheduler._send_command = MagicMock()
+        scheduler._get_result = MagicMock(side_effect=[r0, r1])
+        out = scheduler.get_grammar_bitmask(MagicMock())
+        assert out.structured_output_request_ids == ["a", "b", "c"]
+        assert isinstance(out.grammar_bitmask, np.ndarray)
+        np.testing.assert_array_equal(out.grammar_bitmask[:, 0], [1, 1, 2])
+        scheduler._send_command.assert_any_call(
+            1, SchedulerCommand.GET_GRAMMAR_BITMASK)
 
     def test_get_rank_pending_prefill_tokens(self, mock_vllm_config,
                                              mock_kv_cache_config,
@@ -1381,3 +1403,24 @@ def test_picklable_request_drops_a_compiling_grammar():
     plain = types.SimpleNamespace(request_id="r2",
                                   structured_output_request=None)
     assert _picklable_request(plain) is plain
+
+
+def test_combine_grammar_outputs():
+    """Rank order, ranks without structured-output requests skipped, one
+    rank's output passed through, and a rank's None draft counts as zeros
+    for its requests when another rank has counts."""
+    import torch
+
+    from tpu_inference.core.sched.dp_scheduler import combine_grammar_outputs
+    a = GrammarOutput(["a"], np.zeros((1, 3), np.int32), [2])
+    b = GrammarOutput(["b", "c"], np.ones((2, 3), np.int32))
+    assert combine_grammar_outputs([None, None]) is None
+    assert combine_grammar_outputs([None, a]) is a
+    out = combine_grammar_outputs([a, None, b])
+    assert out.structured_output_request_ids == ["a", "b", "c"]
+    assert out.grammar_bitmask.shape == (3, 3)
+    assert out.num_acceptable_drafts == [2, 0, 0]
+    assert combine_grammar_outputs([b, b]).num_acceptable_drafts is None
+    t = GrammarOutput(["d"], torch.zeros((1, 3), dtype=torch.int32))
+    assert isinstance(
+        combine_grammar_outputs([t, t]).grammar_bitmask, torch.Tensor)
