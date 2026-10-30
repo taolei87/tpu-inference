@@ -73,21 +73,24 @@ class StructuredDecodingManager:
         self.runner.grammar_bitmask_cpu.fill(0)
         self.runner.require_structured_out_cpu.fill(0)
 
-        sorted_struct_requests = sorted(
-            grammar_output.structured_output_request_ids)
-
-        cumulative_mask_idx = 0
-        for req_id in sorted_struct_requests:
-            if req_id not in self.runner.input_batch.req_id_to_index:
+        # The bitmask's rows follow structured_output_request_ids: a list in
+        # vLLM's scheduling order (or, in older vLLM, a dict from request id
+        # to row). Sorting the ids instead gave requests each other's masks
+        # whenever two were scheduled together out of sorted order (always,
+        # under DP, where the ranks' ids are concatenated): the sampled token
+        # then broke the request's grammar and it was terminated.
+        ids = grammar_output.structured_output_request_ids
+        rows = ids.items() if isinstance(
+            ids, dict) else ((req_id, row) for row, req_id in enumerate(ids))
+        for req_id, row in rows:
+            batch_index = self.runner.input_batch.req_id_to_index.get(req_id)
+            if batch_index is None:
                 continue
-            batch_index = self.runner.input_batch.req_id_to_index[req_id]
-            self.runner.grammar_bitmask_cpu[batch_index] = grammar_bitmask[
-                cumulative_mask_idx]
+            self.runner.grammar_bitmask_cpu[batch_index] = grammar_bitmask[row]
             # It's not guaranteed that all requests in this batch require
             # structured output, so create a bool tensor to represent
             # the requests that need structured output.
             self.runner.require_structured_out_cpu[batch_index] = True
-            cumulative_mask_idx += 1
 
         (require_structured_out_cpu,
          grammar_bitmask_cpu, structured_decode_arange) = device_array(

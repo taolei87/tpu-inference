@@ -196,6 +196,22 @@ class TestStructuredDecodingManager:
             np.testing.assert_array_equal(np.array(arange),
                                           np.arange(0, 32, dtype=np.int32))
 
+            # 2b. The current vLLM API: a list, rows in its (scheduling) order,
+            # not sorted (under DP, the ranks' ids concatenated); an id not in
+            # this batch still owns its row.
+            list_output = MagicMock()
+            list_output.structured_output_request_ids = [
+                "req-3", "req-gone", "req-1"
+            ]
+            list_output.grammar_bitmask = np.array(
+                [mask2, np.array([7, 7], dtype=np.int32), mask1])
+            (
+                _, list_bitmask, _
+            ) = self.runner.structured_decoding_manager.prepare_structured_decoding_input(
+                mock_logits_device, list_output)
+            np.testing.assert_array_equal(np.array(list_bitmask),
+                                          expected_grammar_bitmask)
+
             # 3. ===== Test structured_decode_fn =====
             # This function is jitted, so we call it with the device arrays
             modified_logits = self.runner.structured_decoding_manager.structured_decode_fn(
