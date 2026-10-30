@@ -77,3 +77,26 @@ def test_dict_form_maps_ids_to_rows():
     _, bitmask, _ = mgr.prepare_structured_decoding_input(
         jnp.ones((2, 64)), out)
     np.testing.assert_array_equal(np.asarray(bitmask)[:, 0], [2, 1])
+
+
+def test_attention_dp_masks_land_on_the_ranks_padded_logits_rows():
+    """Under attention DP the logits come in padded per-rank segments: with 2
+    ranks of 2 padded rows, batch [a, b, c] on ranks [0, 1, 1] has logits
+    rows [0, 2, 3] (the runner's logits_indices_selector). Without the
+    selector, c's mask landed on b's row and b's on padding."""
+    runner = _runner(["a", "b", "c"])
+    mgr = StructuredDecodingManager(runner)
+    only_low = np.array([-1, 0], np.int32)
+    only_high = np.array([0, -1], np.int32)
+    out = SimpleNamespace(structured_output_request_ids=["b", "c"],
+                          grammar_bitmask=np.stack([only_low, only_high]))
+    logits = jnp.ones((4, 64), jnp.float32)
+    require, bitmask, arange = mgr.prepare_structured_decoding_input(
+        logits, out, np.array([0, 2, 3]))
+    np.testing.assert_array_equal(
+        np.asarray(require)[:, 0], [False, False, True, True])
+    masked = np.asarray(
+        mgr.structured_decode_fn(require, bitmask, logits, arange))
+    assert (masked[0] == 1).all() and (masked[1] == 1).all()
+    assert (masked[2, :32] == 1).all() and (masked[2, 32:] == -np.inf).all()
+    assert (masked[3, :32] == -np.inf).all() and (masked[3, 32:] == 1).all()

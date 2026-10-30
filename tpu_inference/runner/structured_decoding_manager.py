@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from tpu_inference.utils import device_array
 
@@ -63,8 +64,14 @@ class StructuredDecodingManager:
         return jnp.where(require_struct_decoding, masked_logits, logits)
 
     def prepare_structured_decoding_input(
-        self, logits: jax.Array, grammar_output: "GrammarOutput"
+        self,
+        logits: jax.Array,
+        grammar_output: "GrammarOutput",
+        logits_indices_selector: Optional[np.ndarray] = None
     ) -> Tuple[jax.Array, jax.Array, jax.Array]:
+        """`logits_indices_selector` (attention DP): the logits row of each
+        input-batch index. Under DP the logits come in padded per-rank
+        segments, so a request's batch index is not its row."""
         grammar_bitmask = grammar_output.grammar_bitmask
         assert grammar_bitmask is not None
         num_reqs, _ = logits.shape
@@ -86,6 +93,8 @@ class StructuredDecodingManager:
             batch_index = self.runner.input_batch.req_id_to_index.get(req_id)
             if batch_index is None:
                 continue
+            if logits_indices_selector is not None:
+                batch_index = int(logits_indices_selector[batch_index])
             self.runner.grammar_bitmask_cpu[batch_index] = grammar_bitmask[row]
             # It's not guaranteed that all requests in this batch require
             # structured output, so create a bool tensor to represent
