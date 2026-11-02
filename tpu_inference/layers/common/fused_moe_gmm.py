@@ -1019,12 +1019,15 @@ def _a2a_stats(per_chip: np.ndarray, per_expert: np.ndarray, recv_rows: int,
                me: np.ndarray):
     """MOE_A2A_STATS: summarize the rows each chip got, every 500 calls. With
     MOE_A2A_STATS_DUMP (a path), also save every call's rows per expert there
-    (np.save, [calls, experts], every 1000 calls)."""
+    (np.save, [calls, experts], every 1000 calls), up to MOE_A2A_STATS_DUMP_MAX
+    calls when that is set."""
     if int(me) != 0:
         return
-    if envs.MOE_A2A_STATS_DUMP:
+    cap = envs.MOE_A2A_STATS_DUMP_MAX
+    if envs.MOE_A2A_STATS_DUMP and (cap <= 0 or len(_A2A_EXPERT_COUNTS) < cap):
         _A2A_EXPERT_COUNTS.append(np.asarray(per_expert, np.int32))
-        if len(_A2A_EXPERT_COUNTS) % 1000 == 0:
+        n = len(_A2A_EXPERT_COUNTS)
+        if n % 1000 == 0 or n == cap:
             np.save(envs.MOE_A2A_STATS_DUMP, np.stack(_A2A_EXPERT_COUNTS))
     per_chip = np.asarray(per_chip, np.float64)
     if per_chip.sum() == 0:

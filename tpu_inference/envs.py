@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     MOE_A2A_MIN_TOKENS: int = 0
     MOE_A2A_STATS: bool = False
     MOE_A2A_STATS_DUMP: str = ""
+    MOE_A2A_STATS_DUMP_MAX: int = 0
     GLM5_EXPERT_REPLICAS: str = ""
     RAGGED_GATHER_MAX_ROW_SUBCHUNKS: int = 4
     RAGGED_GATHER_TRIM_ROWS: bool = True
@@ -620,6 +621,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("MOE_A2A_STATS", default=False),
     "MOE_A2A_STATS_DUMP":
     lambda: os.getenv("MOE_A2A_STATS_DUMP", ""),
+    # Debug: with MOE_A2A_STATS_DUMP, stop recording after this many MoE calls
+    # and save once (0: no limit). Each save rewrites the whole dump, so an
+    # unlimited dump slows a long-running server.
+    "MOE_A2A_STATS_DUMP_MAX":
+    lambda: int(os.getenv("MOE_A2A_STATS_DUMP_MAX", "0")),
     # GLM-5.3-Flash under expert parallelism: a JSON table of expert copies
     # to put in the padding experts' slots, per MoE layer
     # ({"layers": {"<layer index>": [[expert, slot], ...]}}); the odd tokens
